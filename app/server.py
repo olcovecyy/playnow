@@ -123,8 +123,15 @@ def create_app(overrides=None):
                 initial.execute("ALTER TABLE uploads ADD COLUMN content_fingerprint TEXT")
             initial.execute("""CREATE TABLE IF NOT EXISTS video_shares (
                 id TEXT PRIMARY KEY, video_id TEXT NOT NULL,
-                token_hash TEXT NOT NULL UNIQUE, created_at REAL NOT NULL, revoked_at REAL
+                token_hash TEXT NOT NULL UNIQUE, created_at REAL NOT NULL, revoked_at REAL,
+                scope TEXT NOT NULL DEFAULT 'library'
             )""")
+            share_columns = {row[1] for row in initial.execute("PRAGMA table_info(video_shares)")}
+            if "scope" not in share_columns:
+                initial.execute("ALTER TABLE video_shares ADD COLUMN scope TEXT NOT NULL DEFAULT 'library'")
+            # The owner explicitly broadened every active link, including links
+            # and browser sessions created before the library-sharing feature.
+            initial.execute("UPDATE video_shares SET scope='library' WHERE revoked_at IS NULL AND scope='video'")
             initial.execute("CREATE INDEX IF NOT EXISTS video_shares_video ON video_shares(video_id,created_at)")
             initial.execute("CREATE INDEX IF NOT EXISTS sessions_share ON sessions(share_id)")
             initial.execute("""CREATE TABLE IF NOT EXISTS video_engagement (
@@ -145,9 +152,13 @@ def create_app(overrides=None):
             initial.execute("CREATE INDEX IF NOT EXISTS playback_tickets_expiry ON playback_tickets(expires)")
             initial.execute("CREATE INDEX IF NOT EXISTS playback_tickets_video ON playback_tickets(video_id)")
             initial.execute("DELETE FROM playback_tickets WHERE expires <= ?", (time.time(),))
-            # Older application images only accept viewer/admin. Scoped sessions use
-            # a distinct stored role so an application rollback cannot widen access.
-            initial.execute("UPDATE sessions SET role='share_viewer' WHERE share_id IS NOT NULL AND role='viewer'")
+            # A distinct stored role makes older images reject these sessions
+            # instead of silently applying their previous single-video policy.
+            initial.execute("""UPDATE sessions SET role='share_library_viewer'
+                WHERE role IN ('viewer','share_viewer') AND share_id IN (
+                    SELECT sh.id FROM video_shares sh JOIN videos v ON v.id=sh.video_id
+                    WHERE sh.revoked_at IS NULL AND sh.scope='library'
+                )""")
             initial.execute("COMMIT")
         except BaseException:
             initial.execute("ROLLBACK")
@@ -216,36 +227,38 @@ def create_app(overrides=None):
         audience = audience_id()
         identifier, csrf = secrets.token_hex(32), secrets.token_urlsafe(32)
         expiry = time.time() + app.config["SESSION_HOURS"] * 3600
-        video_id = None
+        share_scope = None
         with transaction() as connection:
             if share_id is not None:
-                grant = connection.execute("SELECT sh.video_id FROM video_shares sh JOIN videos v ON v.id=sh.video_id WHERE sh.id=? AND sh.revoked_at IS NULL", (share_id,)).fetchone()
+                grant = connection.execute("SELECT sh.scope FROM video_shares sh JOIN videos v ON v.id=sh.video_id WHERE sh.id=? AND sh.revoked_at IS NULL AND sh.scope='library'", (share_id,)).fetchone()
                 if not grant or role != "viewer":
                     raise InvalidShare()
-                video_id = grant["video_id"]
+                share_scope = grant["scope"]
             connection.execute("DELETE FROM sessions WHERE expires < ?", (time.time(),))
             if old:
                 connection.execute("DELETE FROM sessions WHERE id = ?", (old,))
-            stored_role = "share_viewer" if share_id is not None else role
+            stored_role = "share_library_viewer" if share_id is not None else role
             connection.execute("INSERT INTO sessions(id,role,csrf,expires,share_id) VALUES(?,?,?,?,?)", (identifier, stored_role, csrf, expiry, share_id))
         session.clear()
         session["sid"] = identifier
         session["audience_id"] = audience
         session.permanent = True
-        g.auth = {"id": identifier, "role": role, "csrf": csrf, "expires": expiry, "share_id": share_id, "video_id": video_id}
+        g.auth = {"id": identifier, "role": role, "csrf": csrf, "expires": expiry, "share_id": share_id, "video_id": None, "share_scope": share_scope}
         return g.auth
 
     def auth():
         if "auth" not in g:
             identifier = session.get("sid", "")
-            row = db().execute("""SELECT s.*,sh.video_id FROM sessions s
+            row = db().execute("""SELECT s.*,sh.scope AS share_scope FROM sessions s
                 LEFT JOIN video_shares sh ON sh.id=s.share_id
                 LEFT JOIN videos v ON v.id=sh.video_id
                 WHERE s.id=? AND s.expires>?
-                AND (s.share_id IS NULL OR (sh.revoked_at IS NULL AND v.id IS NOT NULL))""", (identifier, time.time())).fetchone()
+                AND (s.share_id IS NULL OR (sh.revoked_at IS NULL AND v.id IS NOT NULL AND sh.scope='library'))""", (identifier, time.time())).fetchone()
             g.auth = dict(row) if row else None
+            if g.auth:
+                g.auth["video_id"] = None
             if g.auth and g.auth.get("share_id"):
-                if g.auth["role"] != "share_viewer":
+                if g.auth["role"] != "share_library_viewer" or g.auth["share_scope"] != "library":
                     g.auth = None
                 else:
                     g.auth["role"] = "viewer"
@@ -254,7 +267,7 @@ def create_app(overrides=None):
     def session_json():
         current = auth() or new_session()
         audience_id()
-        return {"role": current["role"], "csrf": current["csrf"], "video_id": current.get("video_id")}
+        return {"role": current["role"], "csrf": current["csrf"], "video_id": current.get("video_id"), "share_scope": current.get("share_scope")}
 
     def json_object():
         payload = request.get_json(silent=True)
@@ -286,12 +299,6 @@ def create_app(overrides=None):
                 return error("Nejprve zadejte heslo.", 401)
             if needs_admin and current["role"] != "admin":
                 return error("Tuto akci může provést pouze správce.", 403)
-            if current.get("share_id") and request.path.startswith(("/media/", "/poster/")):
-                if request.path.split("/", 2)[2] != current.get("video_id"):
-                    return error("Toto video není v přijatém sdílení dostupné.", 403)
-            if current.get("share_id") and request.path.startswith("/api/engagement/"):
-                if request.path.split("/", 4)[3] != current.get("video_id"):
-                    return error("Toto video není v přijatém sdílení dostupné.", 403)
 
     @app.after_request
     def security_headers(response):
@@ -376,7 +383,7 @@ def create_app(overrides=None):
         if not isinstance(token, str) or not SHARE_TOKEN_PATTERN.fullmatch(token):
             return error("Sdílecí odkaz není platný.")
         token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
-        share = db().execute("SELECT sh.id,sh.video_id FROM video_shares sh JOIN videos v ON v.id=sh.video_id WHERE sh.token_hash=? AND sh.revoked_at IS NULL", (token_hash,)).fetchone()
+        share = db().execute("SELECT sh.id,sh.video_id FROM video_shares sh JOIN videos v ON v.id=sh.video_id WHERE sh.token_hash=? AND sh.revoked_at IS NULL AND sh.scope='library'", (token_hash,)).fetchone()
         if not share:
             return error("Sdílecí odkaz už není dostupný.", 401)
         current = auth()
@@ -386,7 +393,7 @@ def create_app(overrides=None):
                 new_session("viewer", share_id=share["id"])
             except InvalidShare:
                 return error("Sdílecí odkaz už není dostupný.", 401)
-        return jsonify(session_json() | {"video_id": share["video_id"]})
+        return jsonify(session_json() | {"requested_video_id": share["video_id"]})
 
     def engagement_json(identifier, connection=None):
         connection = connection or db()
@@ -433,10 +440,9 @@ def create_app(overrides=None):
     @app.get("/api/videos")
     def list_videos():
         current = auth()
-        if current.get("share_id"):
-            rows = db().execute("SELECT * FROM videos WHERE id=?", (current["video_id"],)).fetchall()
-            return jsonify(videos=[video_json(row) for row in rows], storage=None)
         rows = db().execute("SELECT * FROM videos ORDER BY created_at DESC").fetchall()
+        if current.get("share_id"):
+            return jsonify(videos=[video_json(row) for row in rows], storage=None)
         disk = storage.disk_usage()
         return jsonify(videos=[video_json(row) for row in rows], storage={"free": disk.free, "total": disk.total})
 
@@ -515,6 +521,7 @@ def create_app(overrides=None):
             "id": row["id"],
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(row["created_at"])),
             "revoked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(row["revoked_at"])) if row["revoked_at"] is not None else None,
+            "scope": row["scope"],
         }
 
     @app.get("/api/videos/<identifier>/shares")
@@ -522,7 +529,7 @@ def create_app(overrides=None):
         exists = db().execute("SELECT 1 FROM videos WHERE id=?", (identifier,)).fetchone() if valid_id(identifier) else None
         if not exists:
             return error("Video neexistuje.", 404)
-        rows = db().execute("SELECT id,created_at,revoked_at FROM video_shares WHERE video_id=? ORDER BY created_at DESC", (identifier,)).fetchall()
+        rows = db().execute("SELECT id,created_at,revoked_at,scope FROM video_shares WHERE video_id=? ORDER BY created_at DESC", (identifier,)).fetchall()
         return jsonify(shares=[share_json(row) for row in rows])
 
     @app.post("/api/videos/<identifier>/shares")
@@ -535,9 +542,9 @@ def create_app(overrides=None):
         with transaction() as connection:
             if not connection.execute("SELECT 1 FROM videos WHERE id=?", (identifier,)).fetchone():
                 return error("Video neexistuje.", 404)
-            connection.execute("INSERT INTO video_shares(id,video_id,token_hash,created_at) VALUES(?,?,?,?)", (share_id, identifier, token_hash, created))
+            connection.execute("INSERT INTO video_shares(id,video_id,token_hash,created_at,scope) VALUES(?,?,?,?,'library')", (share_id, identifier, token_hash, created))
         base = app.config["PUBLIC_URL"] or request.host_url.rstrip("/")
-        return jsonify(share=share_json({"id": share_id, "created_at": created, "revoked_at": None}), url=f"{base}/?video={identifier}#access={raw_token}"), 201
+        return jsonify(share=share_json({"id": share_id, "created_at": created, "revoked_at": None, "scope": "library"}), url=f"{base}/?video={identifier}#access={raw_token}"), 201
 
     @app.delete("/api/videos/<identifier>/shares/<share_id>")
     def revoke_share(identifier, share_id):

@@ -485,6 +485,7 @@ class BackendTests(unittest.TestCase):
         response = self.client.post(f"/api/videos/{identifier}/shares", headers={"X-CSRF-Token": csrf})
         self.assertEqual(response.status_code, 201, response.get_json())
         payload = response.get_json()
+        self.assertEqual(payload["share"]["scope"], "library")
         parsed = urlsplit(payload["url"])
         self.assertEqual(parsed.scheme, "http")
         self.assertEqual(parse_qs(parsed.query), {"video": [identifier]})
@@ -500,24 +501,37 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.get_json())
         return client, response.get_json()
 
-    def test_shared_session_only_sees_target_and_preserves_range_variants(self):
+    def test_shared_library_sees_all_videos_and_preserves_range_variants_without_management(self):
         first, _old_csrf = self.publish()
         second, csrf = self.publish(b"another-private-video")
         share, token = self.make_share(first, csrf)
         scoped, grant = self.redeem(token)
         self.assertEqual(grant["role"], "viewer")
-        self.assertEqual(grant["video_id"], first)
-        self.assertEqual(scoped.get("/api/session").get_json()["video_id"], first)
+        self.assertIsNone(grant["video_id"])
+        self.assertEqual(grant["requested_video_id"], first)
+        self.assertEqual(grant["share_scope"], "library")
+        self.assertIsNone(scoped.get("/api/session").get_json()["video_id"])
         catalog = scoped.get("/api/videos").get_json()
-        self.assertEqual([item["id"] for item in catalog["videos"]], [first])
+        self.assertEqual({item["id"] for item in catalog["videos"]}, {first, second})
         self.assertIsNone(catalog["storage"])
-        for path in (f"/media/{second}", f"/media/{second}?quality=original", f"/poster/{second}"):
-            self.assertEqual(scoped.get(path).status_code, 403)
+        for path in (f"/media/{second}", f"/media/{second}?quality=original"):
+            response = scoped.get(path, headers={"Range": "bytes=2-6"})
+            self.assertEqual(response.status_code, 206)
+            self.assertEqual(response.data, b"other")
+            response.close()
+        (Path(self.temp.name) / "posters" / f"{second}.jpg").write_bytes(b"test-poster")
+        self.update_video(second, poster=1)
+        poster = scoped.get(f"/poster/{second}")
+        self.assertEqual(poster.status_code, 200)
+        self.assertEqual(poster.data, b"test-poster")
+        poster.close()
         for path in ("/api/uploads", f"/api/videos/{first}/shares"):
             self.assertEqual(scoped.get(path).status_code, 403)
         self.assertEqual(scoped.post(f"/api/videos/{first}/shares", headers={"X-CSRF-Token": grant["csrf"]}).status_code, 403)
         self.assertEqual(scoped.delete(f"/api/videos/{first}/shares/{share['id']}", headers={"X-CSRF-Token": grant["csrf"]}).status_code, 403)
         self.assertEqual(scoped.patch(f"/api/videos/{first}", json={"title": "must fail"}, headers={"X-CSRF-Token": grant["csrf"]}).status_code, 403)
+        self.assertEqual(scoped.post("/api/uploads", json={"filename": "must-fail.mp4", "size": 4}, headers={"X-CSRF-Token": grant["csrf"]}).status_code, 403)
+        self.assertEqual(scoped.delete(f"/api/videos/{second}", headers={"X-CSRF-Token": grant["csrf"]}).status_code, 403)
         compatible = Path(self.temp.name) / "media" / f"{first}.compatible.mp4"
         compatible.write_bytes(b"compatible-copy-bytes")
         self.update_video(first, compatible=1, processing_status="ready")
@@ -546,7 +560,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(scoped.post("/api/share/redeem", json={"token": token}, headers={"X-CSRF-Token": revoked_state["csrf"]}).status_code, 401)
         listing = self.client.get(f"/api/videos/{identifier}/shares").get_json()["shares"]
         self.assertIsNotNone(listing[0]["revoked_at"])
-        self.assertEqual(set(listing[0]), {"id", "created_at", "revoked_at"})
+        self.assertEqual(set(listing[0]), {"id", "created_at", "revoked_at", "scope"})
         self.assertNotIn(token, json.dumps(listing))
         self.assertEqual(self.client.get("/api/session").get_json()["role"], "admin")
 
@@ -561,15 +575,15 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(stored, hashlib.sha256(token.encode()).hexdigest())
             self.assertNotEqual(stored, token)
             stored_role = connection.execute("SELECT role FROM sessions WHERE share_id=?", (share["id"],)).fetchone()[0]
-            self.assertEqual(stored_role, "share_viewer")
-            self.assertNotIn(stored_role, ("viewer", "admin"))
+            self.assertEqual(stored_role, "share_library_viewer")
+            self.assertNotIn(stored_role, ("viewer", "admin", "share_viewer"))
         finally:
             connection.close()
         for path in Path(self.temp.name).glob("catalog.sqlite3*"):
             self.assertNotIn(token.encode(), path.read_bytes())
         restarted = server.create_app(self.config).test_client()
         restarted.set_cookie("playnow_session", scoped.get_cookie("playnow_session").value)
-        self.assertEqual([item["id"] for item in restarted.get("/api/videos").get_json()["videos"]], [identifier])
+        self.assertEqual({item["id"] for item in restarted.get("/api/videos").get_json()["videos"]}, {identifier, second})
         connection = sqlite3.connect(Path(self.temp.name) / "catalog.sqlite3")
         connection.execute("UPDATE sessions SET expires=? WHERE share_id=?", (time.time() - 1, share["id"]))
         connection.commit()
@@ -578,8 +592,11 @@ class BackendTests(unittest.TestCase):
         self.assertIsNone(restarted.get("/api/session").get_json()["role"])
         # The link itself has no expiry: a fresh redemption grants a new bounded session.
         restarted, state = self.redeem(token, restarted)
-        self.assertEqual(state["video_id"], identifier)
-        self.assertEqual(restarted.get(f"/media/{second}").status_code, 403)
+        self.assertIsNone(state["video_id"])
+        self.assertEqual(state["requested_video_id"], identifier)
+        available = restarted.get(f"/media/{second}")
+        self.assertEqual(available.status_code, 200)
+        available.close()
         deleted = self.client.delete(f"/api/videos/{identifier}", headers={"X-CSRF-Token": csrf})
         self.assertEqual(deleted.status_code, 200)
         self.assertEqual(restarted.get("/api/videos").status_code, 401)
@@ -608,14 +625,18 @@ class BackendTests(unittest.TestCase):
         _share, token = self.make_share(identifier, csrf)
         admin, state = self.redeem(token, self.client)
         self.assertEqual(state["role"], "admin")
-        self.assertEqual(state["video_id"], identifier)
+        self.assertIsNone(state["video_id"])
+        self.assertEqual(state["requested_video_id"], identifier)
+        self.assertIsNone(state["share_scope"])
         self.assertIsNone(admin.get("/api/session").get_json()["video_id"])
         self.assertEqual(len(admin.get("/api/videos").get_json()["videos"]), 2)
         viewer = self.app.test_client()
         self.login("viewer", viewer)
         viewer, state = self.redeem(token, viewer)
         self.assertEqual(state["role"], "viewer")
-        self.assertEqual(state["video_id"], identifier)
+        self.assertIsNone(state["video_id"])
+        self.assertEqual(state["requested_video_id"], identifier)
+        self.assertIsNone(state["share_scope"])
         self.assertIsNone(viewer.get("/api/session").get_json()["video_id"])
         self.assertEqual(len(viewer.get("/api/videos").get_json()["videos"]), 2)
         self.assertIsNotNone(viewer.get("/api/videos").get_json()["storage"])
@@ -639,6 +660,93 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(state["csrf"], csrf)
         self.assertIsNone(state["video_id"])
         self.assertEqual(migrated.get("/api/videos").status_code, 200)
+
+    def test_library_share_migration_preserves_existing_tokens_sessions_and_playback(self):
+        first, _old_csrf = self.publish()
+        second, csrf = self.publish(b"second-before-migration")
+        active, token = self.make_share(first, csrf)
+        other_active, other_token = self.make_share(second, csrf)
+        revoked, revoked_token = self.make_share(first, csrf)
+        shared, state = self.redeem(token)
+        other, other_state = self.redeem(other_token)
+        denied, _denied_state = self.redeem(revoked_token)
+        ticket = self.start_playback(first, state["csrf"], shared)
+        self.assertEqual(shared.put(f"/api/engagement/{first}/reaction", json={"reaction": "😮"}, headers={"X-CSRF-Token": state["csrf"]}).status_code, 200)
+        cookies = [client.get_cookie("playnow_session").value for client in (shared, other, denied)]
+        database = Path(self.temp.name) / "catalog.sqlite3"
+        with sqlite3.connect(database) as connection:
+            # Recreate the original grant schema and both historical session roles.
+            connection.execute("UPDATE sessions SET role='viewer' WHERE share_id=?", (active["id"],))
+            connection.execute("UPDATE sessions SET role='share_viewer' WHERE share_id IN (?,?)", (other_active["id"], revoked["id"]))
+            connection.execute("UPDATE video_shares SET revoked_at=? WHERE id=?", (time.time(), revoked["id"]))
+            connection.execute("ALTER TABLE video_shares RENAME TO shares_new")
+            connection.execute("CREATE TABLE video_shares(id TEXT PRIMARY KEY,video_id TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,created_at REAL NOT NULL,revoked_at REAL)")
+            connection.execute("INSERT INTO video_shares SELECT id,video_id,token_hash,created_at,revoked_at FROM shares_new")
+            connection.execute("DROP TABLE shares_new")
+            original_grants = connection.execute("SELECT id,token_hash,created_at,revoked_at FROM video_shares ORDER BY id").fetchall()
+            original_sessions = connection.execute("SELECT id,csrf,expires,share_id FROM sessions ORDER BY id").fetchall()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            applications = list(pool.map(lambda _item: server.create_app(self.config), range(2)))
+        upgraded = [application.test_client() for application in (applications[0], applications[1], applications[0])]
+        for client, cookie in zip(upgraded, cookies):
+            client.set_cookie("playnow_session", cookie)
+        for client, previous in zip(upgraded[:2], (state, other_state)):
+            actual = client.get("/api/session").get_json()
+            self.assertEqual(actual["csrf"], previous["csrf"])
+            self.assertEqual(actual["role"], "viewer")
+            self.assertEqual(actual["share_scope"], "library")
+            self.assertIsNone(actual["video_id"])
+            self.assertEqual({item["id"] for item in client.get("/api/videos").get_json()["videos"]}, {first, second})
+        self.assertEqual(upgraded[2].get("/api/videos").status_code, 401)
+        with sqlite3.connect(database) as connection:
+            self.assertEqual(connection.execute("SELECT id,token_hash,created_at,revoked_at FROM video_shares ORDER BY id").fetchall(), original_grants)
+            self.assertEqual(connection.execute("SELECT id,csrf,expires,share_id FROM sessions ORDER BY id").fetchall(), original_sessions)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM video_shares WHERE scope='library'").fetchone()[0], 3)
+            roles = dict(connection.execute("SELECT share_id,role FROM sessions WHERE share_id IS NOT NULL"))
+            self.assertEqual(roles[active["id"]], "share_library_viewer")
+            self.assertEqual(roles[other_active["id"]], "share_library_viewer")
+            # Previous images accept only these roles, so rollback fails closed.
+            self.assertNotIn(roles[active["id"]], ("viewer", "admin", "share_viewer"))
+        with patch.object(server.time, "time", return_value=time.time() + 10):
+            result = self.qualify(first, ticket, state["csrf"], client=upgraded[0])
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(result.get_json()["engagement"]["views"], 1)
+            self.assertEqual(result.get_json()["engagement"]["my_reaction"], "😮")
+
+    def test_library_share_includes_future_videos_and_keeps_anchor_deletion_lifecycle(self):
+        anchor, _old_csrf = self.publish()
+        second, csrf = self.publish(b"another-library-video")
+        _share, token = self.make_share(anchor, csrf)
+        shared, state = self.redeem(token)
+        third, csrf = self.publish(b"video-uploaded-after-link-creation")
+        self.assertEqual({item["id"] for item in shared.get("/api/videos").get_json()["videos"]}, {anchor, second, third})
+        self.assertEqual(self.client.delete(f"/api/videos/{second}", headers={"X-CSRF-Token": csrf}).status_code, 200)
+        self.assertEqual(shared.get("/api/session").get_json()["share_scope"], "library")
+        self.assertEqual({item["id"] for item in shared.get("/api/videos").get_json()["videos"]}, {anchor, third})
+        self.assertEqual(self.client.delete(f"/api/videos/{anchor}", headers={"X-CSRF-Token": csrf}).status_code, 200)
+        self.assertEqual(shared.get("/api/videos").status_code, 401)
+        self.assertEqual(shared.put(f"/api/engagement/{third}/reaction", json={"reaction": "👍"}, headers={"X-CSRF-Token": state["csrf"]}).status_code, 403)
+        guest = self.app.test_client()
+        guest_state = guest.get("/api/session").get_json()
+        self.assertEqual(guest.post("/api/share/redeem", json={"token": token}, headers={"X-CSRF-Token": guest_state["csrf"]}).status_code, 401)
+        self.assertEqual(self.client.get("/api/session").get_json()["role"], "admin")
+
+    def test_library_share_unknown_scope_and_mismatched_role_fail_closed(self):
+        identifier, csrf = self.publish()
+        share, token = self.make_share(identifier, csrf)
+        shared, _state = self.redeem(token)
+        database = Path(self.temp.name) / "catalog.sqlite3"
+        with sqlite3.connect(database) as connection:
+            connection.execute("UPDATE video_shares SET scope='unrecognized' WHERE id=?", (share["id"],))
+        self.assertEqual(shared.get("/api/videos").status_code, 401)
+        guest = self.app.test_client()
+        guest_state = guest.get("/api/session").get_json()
+        self.assertEqual(guest.post("/api/share/redeem", json={"token": token}, headers={"X-CSRF-Token": guest_state["csrf"]}).status_code, 401)
+        with sqlite3.connect(database) as connection:
+            connection.execute("UPDATE video_shares SET scope='library' WHERE id=?", (share["id"],))
+            connection.execute("UPDATE sessions SET role='admin' WHERE share_id=?", (share["id"],))
+        self.assertEqual(shared.get("/api/videos").status_code, 401)
+        self.assertEqual(shared.get("/api/uploads").status_code, 401)
 
     def start_playback(self, identifier, csrf, client=None):
         response = (client or self.client).post(f"/api/engagement/{identifier}/playback", headers={"X-CSRF-Token": csrf})
@@ -728,7 +836,7 @@ class BackendTests(unittest.TestCase):
             self.assertTrue(all(status == 200 and body["qualified"] for status, body in results), results)
             self.assertEqual(self.client.get(f"/api/engagement/{identifier}").get_json()["views"], 3)
 
-    def test_engagement_auth_origin_scope_and_revoked_share_are_enforced(self):
+    def test_engagement_library_share_counts_all_videos_and_revocation_is_enforced(self):
         first, _old_csrf = self.publish()
         second, csrf = self.publish(b"second-private-video")
         share, token = self.make_share(first, csrf)
@@ -741,7 +849,7 @@ class BackendTests(unittest.TestCase):
         scoped, grant = self.redeem(token)
         headers = {"X-CSRF-Token": grant["csrf"]}
         self.assertEqual(scoped.get(f"/api/engagement/{first}").status_code, 200)
-        self.assertEqual(scoped.get(f"/api/engagement/{second}").status_code, 403)
+        self.assertEqual(scoped.get(f"/api/engagement/{second}").status_code, 200)
         own = f"/api/engagement/{first}/reaction"
         self.assertEqual(scoped.put(own, json={"reaction": "👍"}).status_code, 403)
         for extra in ({"Origin": "https://evil.example"}, {"Sec-Fetch-Site": "cross-site"}):
@@ -753,15 +861,25 @@ class BackendTests(unittest.TestCase):
         ticket = self.start_playback(first, grant["csrf"], scoped)
         self.assertEqual(scoped.post(f"{playback_path}/{ticket}", json={"played_seconds": 10}).status_code, 403)
         self.assertEqual(scoped.post(f"{playback_path}/{ticket}", json={"played_seconds": 10}, headers=headers | {"Sec-Fetch-Site": "cross-site"}).status_code, 403)
-        self.assertEqual(scoped.put(f"/api/engagement/{second}/reaction", json={"reaction": "👍"}, headers=headers).status_code, 403)
-        self.assertEqual(scoped.post(f"/api/engagement/{second}/playback", headers=headers).status_code, 403)
-        self.assertEqual(self.qualify(second, ticket, grant["csrf"], client=scoped).status_code, 403)
+        self.assertEqual(scoped.put(f"/api/engagement/{second}/reaction", json={"reaction": "🤣"}, headers=headers).status_code, 200)
+        second_ticket = self.start_playback(second, grant["csrf"], scoped)
+        self.assertEqual(self.qualify(second, ticket, grant["csrf"], client=scoped).status_code, 404)
         # Existing administrative restrictions under /api/videos stay intact.
         self.assertEqual(scoped.post(f"/api/videos/{first}/playback", headers=headers).status_code, 403)
-        self.assertEqual(self.client.delete(f"/api/videos/{first}/shares/{share['id']}", headers={"X-CSRF-Token": csrf}).status_code, 200)
-        self.assertEqual(scoped.get(f"/api/engagement/{first}").status_code, 401)
-        self.assertEqual(scoped.put(own, json={"reaction": None}, headers=headers).status_code, 403)
-        self.assertEqual(self.qualify(first, ticket, grant["csrf"], client=scoped).status_code, 403)
+        with patch.object(server.time, "time", return_value=time.time() + 10):
+            for video, playback in ((first, ticket), (second, second_ticket)):
+                for _retry in range(2):
+                    result = self.qualify(video, playback, grant["csrf"], client=scoped)
+                    self.assertEqual(result.status_code, 200)
+                    self.assertTrue(result.get_json()["qualified"])
+                    self.assertEqual(result.get_json()["engagement"]["views"], 1)
+            catalog = scoped.get("/api/videos").get_json()
+            self.assertEqual({item["id"]: item["engagement"]["views"] for item in catalog["videos"]}, {first: 1, second: 1})
+            self.assertEqual(self.client.delete(f"/api/videos/{first}/shares/{share['id']}", headers={"X-CSRF-Token": csrf}).status_code, 200)
+            for video in (first, second):
+                self.assertEqual(scoped.get(f"/api/engagement/{video}").status_code, 401)
+            self.assertEqual(scoped.put(own, json={"reaction": None}, headers=headers).status_code, 403)
+            self.assertEqual(self.qualify(first, ticket, grant["csrf"], client=scoped).status_code, 403)
 
     def test_playback_tickets_bind_browser_and_session_and_prune_expiry(self):
         identifier, csrf = self.publish()

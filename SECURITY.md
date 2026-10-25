@@ -1,8 +1,8 @@
 # Security policy
 
 PlayNow is a small, self-hosted private video library. It uses a shared viewer
-password, a separate administrator password, and revocable links to individual
-videos. It is intended for people who trust their administrator and server
+password, a separate administrator password, and revocable links to the entire
+video library. It is intended for people who trust their administrator and server
 operator. It is not a multi-tenant hosting service or a DRM system.
 
 ## Reporting a vulnerability
@@ -28,10 +28,16 @@ an independent penetration test or a guarantee that a deployment is secure.
   access. CSRF tokens and origin checks protect mutations, including login and
   link redemption.
 - A share link is a bearer secret: anyone who receives or forwards it can view
-  its one video until the link is revoked. Only a token hash is stored in the
+  the entire library, including future videos, until the link is revoked. It
+  opens the selected video first. Only a token hash is stored in the
   database. The URL places the token in its fragment, and the frontend removes
-  it from the address before redeeming it. Scoped sessions are revalidated
-  against the share and video on subsequent requests.
+  it from the address before redeeming it. Shared sessions are revalidated
+  against the grant and its anchor video on subsequent requests. Deleting that
+  video invalidates its grants. Shared viewers cannot upload, edit, delete,
+  inspect storage details, or manage links.
+- On upgrade, all previously active single-video grants and their existing
+  sessions gain library access; revoked links remain revoked. New shared
+  session roles fail closed if an older application image is accidentally run.
 - Revoking a share also invalidates its scoped sessions. Expired sessions must
   authenticate again. Revocation does not erase a downloaded copy or stop bytes
   already being delivered by a previously authorized response.

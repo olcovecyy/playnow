@@ -155,7 +155,7 @@ curl --fail http://127.0.0.1:8080/healthz
 
 U HTTPS varianty přidávej stejné `-f` přepínače jako při spuštění. Používej `config --quiet`; běžný výpis rozbalené konfigurace může obsahovat tajemství.
 
-Z jiné sítě otevři veřejnou adresu. Zkontroluj platné HTTPS, přihlášení diváka a správce, odmítnutí přímého média bez přihlášení, malý upload včetně navázání a přehrávání s posunem. Vytvoř odkaz na jediné video, vyzkoušej jej bez původní relace a následně ho zruš. Samotné `/healthz` tyto vlastnosti nepotvrzuje.
+Z jiné sítě otevři veřejnou adresu. Zkontroluj platné HTTPS, přihlášení diváka a správce, odmítnutí přímého média bez přihlášení, malý upload včetně navázání a přehrávání s posunem. Vytvoř sdílecí odkaz, vyzkoušej jej bez původní relace a ověř přístup k celé knihovně i odmítnutí správy a uploadu. Následně odkaz zruš a ověř odmítnutí již přihlášeného příjemce. Samotné `/healthz` tyto vlastnosti nepotvrzuje.
 
 Adresa v `PLAYNOW_PUBLIC_URL` musí odpovídat veřejnému originu. Pro HTTPS instalátor nastavuje secure cookie a jeden důvěryhodný proxy hop. Nepřidávej další hop naslepo. Aplikace kontroluje `Host`, takže lokální katalog nemusí pod jinou adresou fungovat, i když healthcheck projde.
 

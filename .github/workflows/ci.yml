@@ -17,6 +17,6 @@ jobs:
       - run: python -m unittest -v test_backend test_setup
       - run: node --check app/static/app.js
       - run: node --check app/static/watchtime.js
-      - run: node --test test_playback.js
+      - run: node --test test_playback*.js
       - run: python -m compileall -q app scripts
       - run: docker build --tag playnow:ci .

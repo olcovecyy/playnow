@@ -19,7 +19,7 @@ const icons = {
   shield: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6z"/><path d="m8 12 3 3 5-6"/></svg>'
 };
 const $ = (id) => document.getElementById(id);
-const state = { role: null, csrf: '', scopedVideoId: null, requestedVideoId: new URLSearchParams(location.search).get('video'), shareVideoId: null, displayedShareId: null, selectionRevision: 0, preparingFile: false, keepAwake: true, videos: [], uploads: [], storage: null, upload: null, pendingSelection: null, editId: null, editExtension: '', adminPage: location.pathname.startsWith('/admin') };
+const state = { role: null, csrf: '', scopedVideoId: null, shareScope: null, requestedVideoId: new URLSearchParams(location.search).get('video'), shareVideoId: null, displayedShareId: null, selectionRevision: 0, preparingFile: false, keepAwake: true, videos: [], uploads: [], storage: null, upload: null, pendingSelection: null, editId: null, editExtension: '', adminPage: location.pathname.startsWith('/admin') };
 let toastTimer;
 let processingTimer;
 let playerVideoId = null;
@@ -49,7 +49,7 @@ function eta(seconds) { if (!Number.isFinite(seconds) || seconds < 0) return '';
 function date(value) { if (!value) return ''; const d = new Date(typeof value === 'number' ? value * 1000 : value); return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString('cs-CZ', { day: 'numeric', month: 'short', year: 'numeric' }); }
 function remember(upload) { try { const all = JSON.parse(localStorage.getItem('playnow.uploads') || '{}'); all[upload.id] = { filename: upload.file.name, size: upload.file.size, lastModified: upload.file.lastModified, content_fingerprint: upload.contentFingerprint || null }; localStorage.setItem('playnow.uploads', JSON.stringify(all)); } catch (_) {} }
 function remembered(id) { try { return JSON.parse(localStorage.getItem('playnow.uploads') || '{}')[id]; } catch (_) { return null; } }
-function applySession(session) { const nextRole = session.role || null, nextCsrf = session.csrf || '', nextVideo = session.video_id || null; if (state.role !== nextRole || state.csrf !== nextCsrf || state.scopedVideoId !== nextVideo) resetEngagementSession(); state.role = nextRole; state.csrf = nextCsrf; state.scopedVideoId = nextVideo; }
+function applySession(session) { const nextRole = session.role || null, nextCsrf = session.csrf || '', nextVideo = session.video_id || null, nextScope = session.share_scope || null; if (state.role !== nextRole || state.csrf !== nextCsrf || state.scopedVideoId !== nextVideo || state.shareScope !== nextScope) resetEngagementSession(); state.role = nextRole; state.csrf = nextCsrf; state.scopedVideoId = nextVideo; state.shareScope = nextScope; }
 function forget(id) { try { const all = JSON.parse(localStorage.getItem('playnow.uploads') || '{}'); delete all[id]; localStorage.setItem('playnow.uploads', JSON.stringify(all)); } catch (_) {} }
 async function api(path, options = {}) {
   const requestEpoch = engagementEpoch;
@@ -62,7 +62,7 @@ async function api(path, options = {}) {
   if (!response.ok) {
     const error = new Error(body.error || `Požadavek se nepodařil (${response.status}).`); error.status = response.status; error.data = body;
     if (response.status === 401 && requestEpoch === engagementEpoch && path !== '/api/login' && path !== '/api/share/redeem') {
-      state.role = null; state.scopedVideoId = null;
+      state.role = null; state.scopedVideoId = null; state.shareScope = null;
       if (state.upload) { state.upload.paused = true; state.upload.controller?.abort(); }
       renderLogin('Přístup vypršel nebo byl zrušený. Můžeš se přihlásit heslem.');
       const refreshEpoch = engagementEpoch, refreshController = new AbortController();
@@ -83,7 +83,7 @@ function header() {
   const target = $('header-actions'); target.replaceChildren(); target.classList.toggle('authenticated-nav', !!state.role);
   if (state.role && !(state.adminPage && state.role !== 'admin')) {
     if (state.role === 'admin' && state.adminPage) target.append(node('span', 'admin-view-badge', 'Správce'));
-    else if (state.role !== 'admin') { const badge = node('span', 'private-badge'); badge.append(icon('lock'), node('span', '', state.scopedVideoId ? 'Sdílené video' : 'Soukromá knihovna')); target.append(badge); }
+    else if (state.role !== 'admin') { const badge = node('span', 'private-badge'); badge.append(icon('lock'), node('span', '', state.shareScope === 'library' ? 'Sdílená knihovna' : state.scopedVideoId ? 'Sdílené video' : 'Soukromá knihovna')); target.append(badge); }
     if (!state.adminPage) { const manager = node('a', 'nav-link', 'Správce'); manager.href = '/admin'; target.append(manager); }
     target.append(button('Odhlásit', 'nav-link', logout));
   } else {
@@ -117,7 +117,7 @@ async function logout() {
   if (state.upload) { state.upload.paused = true; state.upload.controller?.abort(); }
   releaseScreenWakeLock();
   try { await api('/api/logout', { method: 'POST' }); } catch (error) { if (error.status !== 401) { toast(error.message); return; } }
-  state.role = null; state.scopedVideoId = null; state.upload = null; state.csrf = ''; try { const session = await api('/api/session'); applySession(session); } catch (_) {} renderLogin();
+  state.role = null; state.scopedVideoId = null; state.shareScope = null; state.upload = null; state.csrf = ''; try { const session = await api('/api/session'); applySession(session); } catch (_) {} renderLogin();
 }
 async function loadCatalog() {
   const read = engagementReadContext(); const result = await api('/api/videos'); if (read.epoch !== engagementEpoch || !state.role) return; state.videos = result.videos || []; state.storage = result.storage; ingestCatalogEngagement(state.videos, read);
@@ -126,7 +126,7 @@ async function loadCatalog() {
   scheduleProcessingPoll();
 }
 function renderCatalog() {
-  header(); const main = $('app'); main.replaceChildren(); const catalog = node('section', 'catalog'); const top = node('div', 'catalog-heading'); const title = node('div'); title.append(node('p', 'eyebrow', state.adminPage ? 'ZA OPONOU' : state.scopedVideoId ? 'JEN PRO TEBE' : 'VEČER PODLE TEBE'), node('h1', '', state.adminPage ? 'Správce videí.' : state.scopedVideoId ? 'Video pro tebe.' : 'Vítej v našem kině.'), node('p', 'catalog-intro', state.adminPage ? 'Nahrávej, přejmenovávej a sdílej naše videa.' : state.scopedVideoId ? 'Udělej si pohodlí. Tohle video s tebou někdo sdílel.' : 'Vyber si video, udělej si pohodlí a stiskni Play now.'));
+  header(); const main = $('app'); main.replaceChildren(); const catalog = node('section', 'catalog'); const top = node('div', 'catalog-heading'); const title = node('div'); title.append(node('p', 'eyebrow', state.adminPage ? 'ZA OPONOU' : 'VEČER PODLE TEBE'), node('h1', '', state.adminPage ? 'Správce videí.' : 'playnow.'), node('p', 'catalog-intro', state.adminPage ? 'Nahrávej, přejmenovávej a sdílej naše videa.' : 'Vyber si video, udělej si pohodlí a stiskni Play now.'));
   const n = state.videos.length; top.append(title, node('span', 'catalog-count', `${n} ${n === 1 ? 'video' : n > 1 && n < 5 ? 'videa' : 'videí'}`)); catalog.append(top);
   if (state.role === 'admin' && state.adminPage) catalog.append(renderAdmin());
   if (state.adminPage) catalog.append(node('div', 'section-line', 'V knihovně'));
@@ -217,6 +217,10 @@ async function changeReaction(identifier, reaction) {
   catch (error) { if (!controller.signal.aborted && context.epoch === engagementEpoch) { if (error.status === 403) await refreshEngagementSession(context); if (context.epoch === engagementEpoch) toast('Reakci se nepodařilo uložit. Zkus to prosím znovu.'); } }
   finally { engagementControllers.delete(controller); if (reactionRequests.get(identifier) === controller) { reactionRequests.delete(identifier); updateEngagementSurfaces(identifier); } }
 }
+function playbackIsPresented() {
+  const player = $('video-player');
+  return !document.hidden || document.pictureInPictureElement === player || player.webkitPresentationMode === 'picture-in-picture' || player.webkitCurrentPlaybackTargetIsWireless === true || player.remote?.state === 'connected';
+}
 function currentPlaybackTracker(tracker) { return playbackTracker === tracker && tracker.epoch === engagementEpoch && playerVideoId === tracker.videoId && $('player-dialog').open && !!state.role; }
 function beginPlaybackTracking(video) {
   stopPlaybackTracking();
@@ -228,8 +232,9 @@ function suspendPlaybackTracking() { if (playbackTracker) { playbackTracker.acti
 function samplePlaybackTracker(tracker) {
   if (!currentPlaybackTracker(tracker) || tracker.disabled || tracker.qualified) return;
   const player = $('video-player');
-  PlayNowWatchTime.sample(tracker.clock, { nowMs: performance.now(), mediaTime: player.currentTime, playbackRate: player.playbackRate, playing: tracker.active, paused: player.paused, seeking: player.seeking, readyState: player.readyState, ended: player.ended, visible: !document.hidden });
-  if (tracker.active && !player.paused && !player.seeking && player.readyState >= 3 && !document.hidden) ensurePlaybackTicket(tracker);
+  const presented = playbackIsPresented();
+  PlayNowWatchTime.sample(tracker.clock, { nowMs: performance.now(), mediaTime: player.currentTime, playbackRate: player.playbackRate, playing: tracker.active, paused: player.paused, seeking: player.seeking, readyState: player.readyState, ended: player.ended, visible: presented });
+  if (tracker.active && !player.paused && !player.seeking && player.readyState >= 3 && presented) ensurePlaybackTicket(tracker);
   qualifyPlayback(tracker);
 }
 async function ensurePlaybackTicket(tracker) {
@@ -261,12 +266,15 @@ trackedPlayer.addEventListener('playing', () => { const tracker = playbackTracke
 function finishPlaybackInterval() {
   const tracker = playbackTracker;
   if (tracker && currentPlaybackTracker(tracker) && tracker.active && !trackedPlayer.seeking && !tracker.disabled && !tracker.qualified) {
-    PlayNowWatchTime.sample(tracker.clock, { nowMs: performance.now(), mediaTime: trackedPlayer.currentTime, playbackRate: trackedPlayer.playbackRate, playing: true, paused: false, seeking: false, readyState: 3, ended: false, visible: !document.hidden });
+    PlayNowWatchTime.sample(tracker.clock, { nowMs: performance.now(), mediaTime: trackedPlayer.currentTime, playbackRate: trackedPlayer.playbackRate, playing: true, paused: false, seeking: false, readyState: 3, ended: false, visible: playbackIsPresented() });
     qualifyPlayback(tracker);
   }
   suspendPlaybackTracking();
 }
-['pause', 'waiting', 'stalled', 'ended'].forEach(event => trackedPlayer.addEventListener(event, finishPlaybackInterval));
+// A network "stalled" event can occur while buffered video keeps playing.
+// Advancing media time, rather than download activity, determines credit.
+['pause', 'waiting', 'ended'].forEach(event => trackedPlayer.addEventListener(event, finishPlaybackInterval));
+trackedPlayer.addEventListener('timeupdate', () => { if (playbackTracker) samplePlaybackTracker(playbackTracker); });
 ['seeking', 'emptied', 'error'].forEach(event => trackedPlayer.addEventListener(event, suspendPlaybackTracking));
 trackedPlayer.addEventListener('seeked', () => { const tracker = playbackTracker; if (!tracker || !currentPlaybackTracker(tracker)) return; PlayNowWatchTime.reset(tracker.clock); tracker.active = tracker.hasPlayed && !trackedPlayer.paused && trackedPlayer.readyState >= 3; samplePlaybackTracker(tracker); });
 trackedPlayer.addEventListener('ratechange', () => { if (playbackTracker) PlayNowWatchTime.reset(playbackTracker.clock); });
@@ -581,7 +589,7 @@ function openRequestedVideo() {
     if (initialShareToken !== null && !state.adminPage) {
       try {
         const redeemed = await api('/api/share/redeem', { method: 'POST', json: { token: initialShareToken } });
-        state.requestedVideoId = redeemed.video_id || state.requestedVideoId;
+        state.requestedVideoId = redeemed.requested_video_id || state.requestedVideoId;
         applySession(await api('/api/session'));
       } catch (_) { shareError = 'Tenhle odkaz není platný nebo už byl zrušený. Můžeš se přihlásit heslem.'; }
       finally { initialShareToken = null; }

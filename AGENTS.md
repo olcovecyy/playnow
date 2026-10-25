@@ -18,7 +18,7 @@ PlayNow je soukromý přehrávač a katalog vlastních videí. Udržuj české r
 
 ## Při úpravách
 
-- Zachovej kontrolu přihlášení i na přímých adresách videí, CSRF, omezení pokusů, sdílení omezené na jedno video a jeho odvolání.
+- Zachovej kontrolu přihlášení i na přímých adresách videí, CSRF, omezení pokusů a odvolání sdílení. Sdílecí odkaz zpřístupňuje celou knihovnu včetně budoucích videí, ale nikdy správu nebo upload. Ověř také migraci starších odkazů a jejich přihlášených relací.
 - Neměň ID videa při přejmenování. Nepřepisuj kolidující soubor; zachovej obnovitelné přejmenování a původní obsah.
 - Upload zpracovávej po částech. Otisk pro navázání používá pouze malé vzorky; není důkazem úplné integrity celého videa.
 - Nedělej živý převod 4K videa. Samostatný worker připravuje menší přehrávací kopii; originál zachovává.

@@ -24,7 +24,7 @@ Doménu připoj přes HTTPS proxy. Pokud nejde přijímat spojení doma, vytvoř
 
 U existující instalace nejdřív vytvoř konzistentní zálohu konfigurace, databáze a médií se zachováním hardlinků. Žádné down -v, mazání volumes nebo plošné promazávání.
 
-Nakonec ověř přihlášení obou rolí, odmítnutí nepřihlášeného přístupu k médiím, upload a navázání, přehrávání s posunem, sdílecí odkaz omezený na jediné video a jeho zrušení. Použij malý vlastní testovací klip. Ověř veřejné HTTPS zvenku a porovnej stav ostatních služeb.
+Nakonec ověř přihlášení obou rolí, odmítnutí nepřihlášeného přístupu k médiím, upload a navázání, přehrávání s posunem, sdílecí odkaz do celé knihovny a jeho zrušení. Odkaz nesmí umožnit správu ani upload; po zrušení musí přestat fungovat i dříve přihlášeným příjemcům. Použij malé vlastní testovací klipy. Ověř veřejné HTTPS zvenku a porovnej stav ostatních služeb.
 
 Předej adresu katalogu a /admin, umístění konfiguračních souborů, postup zálohy a aktualizace a přesně rozliš provedené kontroly od dosud neověřených věcí. Neprohlašuj test na fyzickém iPhonu nebo plynulé 4K/120 fps bez skutečného testu.
 ```

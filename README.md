@@ -7,7 +7,7 @@ PlayNow je otevřený webový katalog a přehrávač vlastních videí. Nahraje�
 ## Co umí
 
 - Katalog za heslem a samostatný **Správce** na `/admin` s odlišným heslem.
-- Odkaz bez hesla na **jediné video**; jeho platnost může správce zrušit i již přihlášeným hostům.
+- Odkaz bez hesla do **celé knihovny**; rovnou otevře vybrané video. Jeho platnost může správce zrušit i již přihlášeným hostům. Správa a upload vyžadují heslo správce.
 - Upload po 8 MiB až do **100 GiB**, pozastavení a navázání opětovným výběrem stejného souboru. Na iPhonu nabízí výběr z Fotek i Souborů.
 - Zachování originálu včetně 4K/120 fps a samostatnou menší H.264 kopii do **Full HD / 60 fps**. Přehrávač umožňuje obě verze přepínat.
 - Úpravu titulku, popisu i skutečného názvu souboru při zachování jeho přípony a sdílecích odkazů.
@@ -16,9 +16,11 @@ PlayNow je otevřený webový katalog a přehrávač vlastních videí. Nahraje�
 
 Skutečné přehrávání originálu závisí na kodeku, prohlížeči, zařízení a rychlosti připojení. Menší verzi připravuje omezený samostatný worker; nejde o živý převod 4K a příprava může trvat déle než samotné video. Na telefonu nech během velkého uploadu prohlížeč otevřený a displej odemčený. Uspání lze blokovat jen podle možností prohlížeče.
 
-Zhlédnutí se započítá nejvýše jednou za otevření přehrávače, až po 10 sekundách skutečného přehrávání ve viditelné kartě. Pauza, načítání a přeskočené úseky se nezapočítávají; přepnutí kvality již přehraný čas zachová. Opakované odeslání stejného přehrávání nepřidá další zhlédnutí. Jde o počet přehrání, nikoli unikátních lidí. Server zároveň vyžaduje alespoň 10 sekund od zahájení přehrávání; samotný průběh videa vyhodnocuje prohlížeč.
+Zhlédnutí se započítá nejvýše jednou za otevření přehrávače, až po 10 sekundách skutečného přehrávání ve viditelné kartě, obrazu v obraze nebo při rozpoznaném vzdáleném přehrávání. Pauza, načítání a přeskočené úseky se nezapočítávají; přepnutí kvality již přehraný čas zachová. Výpadek stahování nepřeruší počítání, pokud video dál běží z bufferu. Opakované odeslání stejného přehrávání nepřidá další zhlédnutí. Jde o počet přehrání, nikoli unikátních lidí. Server zároveň vyžaduje alespoň 10 sekund od zahájení přehrávání; samotný průběh videa vyhodnocuje prohlížeč.
 
-Prohlížeč může mít u videa jednu reakci. Dalším stiskem ji zrušíš, jinou reakcí nahradíš. Identita je náhodná a uložená v podepsané relační cookie; přihlášení jinou rolí ji zachová, ale jiný prohlížeč nebo vymazání cookies vytvoří novou. Statistiky i reakce respektují přihlášení a omezení sdíleného odkazu na jediné video.
+Prohlížeč může mít u videa jednu reakci. Dalším stiskem ji zrušíš, jinou reakcí nahradíš. Identita je náhodná a uložená v podepsané relační cookie; přihlášení jinou rolí ji zachová, ale jiný prohlížeč nebo vymazání cookies vytvoří novou. Statistiky i reakce jsou dostupné přihlášeným divákům i příjemcům aktivního sdílecího odkazu.
+
+Aktualizace rozšíří také dříve vytvořené aktivní odkazy a jejich přihlášené relace na celou knihovnu, včetně později přidaných videí. Zrušené odkazy zůstanou zrušené. Odkaz lze odvolat ve Správci u původně vybraného videa; smazání tohoto videa zneplatní také jeho odkazy.
 
 ## Rychlé spuštění
 
