@@ -3,6 +3,7 @@
 import contextlib
 import fcntl
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -27,6 +28,9 @@ CHUNK_SIZE = 8 * 1024 * 1024
 MAX_FILE_SIZE = 100 * 1024**3
 ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 SHARE_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
+REACTIONS = ("👍", "🤣", "🤪", "😭", "😮")
+MINIMUM_PLAYBACK_SECONDS = 10
+PLAYBACK_TICKET_SECONDS = 24 * 3600
 
 
 def create_app(overrides=None):
@@ -123,6 +127,24 @@ def create_app(overrides=None):
             )""")
             initial.execute("CREATE INDEX IF NOT EXISTS video_shares_video ON video_shares(video_id,created_at)")
             initial.execute("CREATE INDEX IF NOT EXISTS sessions_share ON sessions(share_id)")
+            initial.execute("""CREATE TABLE IF NOT EXISTS video_engagement (
+                video_id TEXT PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
+                views INTEGER NOT NULL DEFAULT 0 CHECK(views >= 0)
+            )""")
+            initial.execute("""CREATE TABLE IF NOT EXISTS video_reactions (
+                video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+                audience_id TEXT NOT NULL,
+                reaction TEXT NOT NULL CHECK(reaction IN ('👍','🤣','🤪','😭','😮')),
+                PRIMARY KEY(video_id,audience_id)
+            )""")
+            initial.execute("""CREATE TABLE IF NOT EXISTS playback_tickets (
+                id TEXT PRIMARY KEY, video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+                audience_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                created_at REAL NOT NULL, expires REAL NOT NULL, qualified_at REAL
+            )""")
+            initial.execute("CREATE INDEX IF NOT EXISTS playback_tickets_expiry ON playback_tickets(expires)")
+            initial.execute("CREATE INDEX IF NOT EXISTS playback_tickets_video ON playback_tickets(video_id)")
+            initial.execute("DELETE FROM playback_tickets WHERE expires <= ?", (time.time(),))
             # Older application images only accept viewer/admin. Scoped sessions use
             # a distinct stored role so an application rollback cannot widen access.
             initial.execute("UPDATE sessions SET role='share_viewer' WHERE share_id IS NOT NULL AND role='viewer'")
@@ -174,8 +196,24 @@ def create_app(overrides=None):
     class InvalidShare(Exception):
         pass
 
+    def audience_id():
+        identifier = session.get("audience_id")
+        if not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{64}", identifier):
+            old = session.get("sid")
+            # Existing signed cookies acquire the same identity even if their
+            # first requests arrive concurrently, before a new cookie is saved.
+            if isinstance(old, str) and re.fullmatch(r"[0-9a-f]{64}", old):
+                key = app.config["SECRET_KEY"]
+                key = key.encode() if isinstance(key, str) else key
+                identifier = hmac.new(key, b"playnow-audience:" + old.encode(), hashlib.sha256).hexdigest()
+            else:
+                identifier = secrets.token_hex(32)
+            session["audience_id"] = identifier
+        return identifier
+
     def new_session(role=None, share_id=None):
         old = session.get("sid")
+        audience = audience_id()
         identifier, csrf = secrets.token_hex(32), secrets.token_urlsafe(32)
         expiry = time.time() + app.config["SESSION_HOURS"] * 3600
         video_id = None
@@ -192,6 +230,7 @@ def create_app(overrides=None):
             connection.execute("INSERT INTO sessions(id,role,csrf,expires,share_id) VALUES(?,?,?,?,?)", (identifier, stored_role, csrf, expiry, share_id))
         session.clear()
         session["sid"] = identifier
+        session["audience_id"] = audience
         session.permanent = True
         g.auth = {"id": identifier, "role": role, "csrf": csrf, "expires": expiry, "share_id": share_id, "video_id": video_id}
         return g.auth
@@ -214,6 +253,7 @@ def create_app(overrides=None):
 
     def session_json():
         current = auth() or new_session()
+        audience_id()
         return {"role": current["role"], "csrf": current["csrf"], "video_id": current.get("video_id")}
 
     def json_object():
@@ -238,7 +278,7 @@ def create_app(overrides=None):
             token = request.headers.get("X-CSRF-Token", "")
             if not current or not token or not secrets.compare_digest(current["csrf"], token):
                 return error("Platnost formuláře vypršela. Obnovte stránku.", 403)
-        needs_viewer = request.path.startswith(("/api/videos", "/media/", "/poster/"))
+        needs_viewer = request.path.startswith(("/api/videos", "/api/engagement", "/media/", "/poster/"))
         needs_admin = request.path.startswith("/api/uploads") or (request.path.startswith("/api/videos") and (request.method in ("POST", "PATCH", "DELETE") or "/shares" in request.path))
         if needs_viewer or needs_admin:
             current = auth()
@@ -248,6 +288,9 @@ def create_app(overrides=None):
                 return error("Tuto akci může provést pouze správce.", 403)
             if current.get("share_id") and request.path.startswith(("/media/", "/poster/")):
                 if request.path.split("/", 2)[2] != current.get("video_id"):
+                    return error("Toto video není v přijatém sdílení dostupné.", 403)
+            if current.get("share_id") and request.path.startswith("/api/engagement/"):
+                if request.path.split("/", 4)[3] != current.get("video_id"):
                     return error("Toto video není v přijatém sdílení dostupné.", 403)
 
     @app.after_request
@@ -345,6 +388,15 @@ def create_app(overrides=None):
                 return error("Sdílecí odkaz už není dostupný.", 401)
         return jsonify(session_json() | {"video_id": share["video_id"]})
 
+    def engagement_json(identifier, connection=None):
+        connection = connection or db()
+        summary = connection.execute("SELECT views FROM video_engagement WHERE video_id=?", (identifier,)).fetchone()
+        counts = dict.fromkeys(REACTIONS, 0)
+        for row in connection.execute("SELECT reaction,COUNT(*) AS total FROM video_reactions WHERE video_id=? GROUP BY reaction", (identifier,)):
+            counts[row["reaction"]] = row["total"]
+        mine = connection.execute("SELECT reaction FROM video_reactions WHERE video_id=? AND audience_id=?", (identifier, audience_id())).fetchone()
+        return {"views": summary["views"] if summary else 0, "reactions": counts, "my_reaction": mine["reaction"] if mine else None}
+
     def video_json(row):
         item = dict(row)
         item.pop("source_sha256", None)
@@ -366,6 +418,7 @@ def create_app(overrides=None):
             "codec": item.pop("compatible_codec", None), "hdr": bool(item.pop("compatible_hdr", 0)),
             "error": item.pop("processing_error", None),
         }
+        item["engagement"] = engagement_json(item["id"])
         return item
 
     def upload_json(row):
@@ -386,6 +439,76 @@ def create_app(overrides=None):
         rows = db().execute("SELECT * FROM videos ORDER BY created_at DESC").fetchall()
         disk = storage.disk_usage()
         return jsonify(videos=[video_json(row) for row in rows], storage={"free": disk.free, "total": disk.total})
+
+    def engagement_video_exists(identifier, connection=None):
+        return valid_id(identifier) and (connection or db()).execute("SELECT 1 FROM videos WHERE id=?", (identifier,)).fetchone()
+
+    @app.get("/api/engagement/<identifier>")
+    def get_engagement(identifier):
+        if not engagement_video_exists(identifier):
+            return error("Video neexistuje.", 404)
+        return jsonify(engagement_json(identifier))
+
+    @app.put("/api/engagement/<identifier>/reaction")
+    def react(identifier):
+        payload = json_object()
+        reaction = payload.get("reaction")
+        if "reaction" not in payload or (reaction is not None and reaction not in REACTIONS):
+            return error("Vyberte platnou reakci.")
+        audience = audience_id()
+        with transaction() as connection:
+            if not engagement_video_exists(identifier, connection):
+                return error("Video neexistuje.", 404)
+            if reaction is None:
+                connection.execute("DELETE FROM video_reactions WHERE video_id=? AND audience_id=?", (identifier, audience))
+            else:
+                connection.execute("""INSERT INTO video_reactions(video_id,audience_id,reaction) VALUES(?,?,?)
+                    ON CONFLICT(video_id,audience_id) DO UPDATE SET reaction=excluded.reaction""", (identifier, audience, reaction))
+            result = engagement_json(identifier, connection)
+        return jsonify(result)
+
+    @app.post("/api/engagement/<identifier>/playback")
+    def start_playback(identifier):
+        now = time.time()
+        ticket = uuid.uuid4().hex
+        current = auth()
+        with transaction() as connection:
+            connection.execute("DELETE FROM playback_tickets WHERE expires <= ?", (now,))
+            if not engagement_video_exists(identifier, connection):
+                return error("Video neexistuje.", 404)
+            connection.execute("""INSERT INTO playback_tickets(id,video_id,audience_id,session_id,created_at,expires)
+                VALUES(?,?,?,?,?,?)""", (ticket, identifier, audience_id(), current["id"], now, min(now + PLAYBACK_TICKET_SECONDS, current["expires"])))
+        return jsonify(playback_id=ticket, minimum_seconds=MINIMUM_PLAYBACK_SECONDS), 201
+
+    @app.post("/api/engagement/<identifier>/playback/<ticket>")
+    def qualify_playback(identifier, ticket):
+        if not valid_id(ticket) or not valid_id(identifier):
+            return error("Přehrávání už není dostupné.", 404)
+        seconds = json_object().get("played_seconds")
+        try:
+            valid_seconds = not isinstance(seconds, bool) and isinstance(seconds, (int, float)) and math.isfinite(seconds) and seconds >= MINIMUM_PLAYBACK_SECONDS
+        except (ValueError, OverflowError):
+            valid_seconds = False
+        if not valid_seconds:
+            return error("Pro započítání je potřeba alespoň deset sekund přehrávání.")
+        now = time.time()
+        with transaction() as connection:
+            connection.execute("DELETE FROM playback_tickets WHERE expires <= ?", (now,))
+            row = connection.execute("""SELECT * FROM playback_tickets
+                WHERE id=? AND video_id=? AND audience_id=? AND session_id=?""", (ticket, identifier, audience_id(), auth()["id"])).fetchone()
+            if not row:
+                return error("Přehrávání už není dostupné.", 404)
+            if row["qualified_at"] is None:
+                remaining = MINIMUM_PLAYBACK_SECONDS - (now - row["created_at"])
+                if remaining > 0:
+                    return jsonify(qualified=False, retry_after=max(0.001, round(remaining, 3)), engagement=engagement_json(identifier, connection))
+                # The client supplies actual played time; the server separately
+                # enforces elapsed time and serializes qualification/increment.
+                connection.execute("UPDATE playback_tickets SET qualified_at=? WHERE id=? AND qualified_at IS NULL", (now, ticket))
+                connection.execute("""INSERT INTO video_engagement(video_id,views) VALUES(?,1)
+                    ON CONFLICT(video_id) DO UPDATE SET views=views+1""", (identifier,))
+            result = engagement_json(identifier, connection)
+        return jsonify(qualified=True, engagement=result)
 
     def share_json(row):
         return {

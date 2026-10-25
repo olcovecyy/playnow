@@ -310,8 +310,15 @@ class BackendTests(unittest.TestCase):
         identifier, _csrf = self.publish()
         # Recreate just the historical table shape, then start the upgraded application.
         connection = sqlite3.connect(Path(self.temp.name) / "catalog.sqlite3")
+        for table in ("video_reactions", "playback_tickets", "video_engagement"):
+            connection.execute(f"DROP TABLE {table}")
         connection.execute("ALTER TABLE videos RENAME TO videos_new")
-        connection.execute("CREATE TABLE videos AS SELECT id,filename,title,description,size,created_at,mime,duration,poster FROM videos_new")
+        connection.execute("""CREATE TABLE videos (
+            id TEXT PRIMARY KEY, filename TEXT NOT NULL, title TEXT NOT NULL,
+            description TEXT NOT NULL, size INTEGER NOT NULL, created_at REAL NOT NULL,
+            mime TEXT NOT NULL, duration REAL, poster INTEGER NOT NULL DEFAULT 0
+        )""")
+        connection.execute("INSERT INTO videos SELECT id,filename,title,description,size,created_at,mime,duration,poster FROM videos_new")
         connection.execute("DROP TABLE videos_new")
         connection.commit()
         connection.close()
@@ -632,6 +639,202 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(state["csrf"], csrf)
         self.assertIsNone(state["video_id"])
         self.assertEqual(migrated.get("/api/videos").status_code, 200)
+
+    def start_playback(self, identifier, csrf, client=None):
+        response = (client or self.client).post(f"/api/engagement/{identifier}/playback", headers={"X-CSRF-Token": csrf})
+        self.assertEqual(response.status_code, 201, response.get_json())
+        self.assertEqual(response.get_json()["minimum_seconds"], 10)
+        return response.get_json()["playback_id"]
+
+    def qualify(self, identifier, ticket, csrf, seconds=10, client=None):
+        return (client or self.client).post(f"/api/engagement/{identifier}/playback/{ticket}", json={"played_seconds": seconds}, headers={"X-CSRF-Token": csrf})
+
+    def test_engagement_reactions_are_exact_idempotent_and_browser_scoped(self):
+        identifier, _csrf = self.publish()
+        zero = {"views": 0, "reactions": dict.fromkeys(server.REACTIONS, 0), "my_reaction": None}
+        self.assertEqual(self.client.get("/api/videos").get_json()["videos"][0]["engagement"], zero)
+        self.assertEqual(self.client.get(f"/api/engagement/{identifier}").get_json(), zero)
+        viewer = self.app.test_client()
+        csrf = self.login("viewer", viewer)
+        endpoint = f"/api/engagement/{identifier}/reaction"
+        headers = {"X-CSRF-Token": csrf}
+        for invalid in ("👎", "❤️", "👍🏻", "👍\ufe0f", "", True, 1, ["👍"], {"reaction": "👍"}):
+            self.assertEqual(viewer.put(endpoint, json={"reaction": invalid}, headers=headers).status_code, 400)
+        self.assertEqual(viewer.put(endpoint, json={}, headers=headers).status_code, 400)
+        for emoji in server.REACTIONS:
+            for _attempt in range(2):
+                result = viewer.put(endpoint, json={"reaction": emoji}, headers=headers).get_json()
+                self.assertEqual(result["my_reaction"], emoji)
+                self.assertEqual(result["reactions"], {key: int(key == emoji) for key in server.REACTIONS})
+        # Authentication rotation retains the anonymous browser reaction.
+        self.assertEqual(viewer.post("/api/logout", headers=headers).status_code, 200)
+        csrf = self.login("admin", viewer)
+        result = viewer.get(f"/api/engagement/{identifier}").get_json()
+        self.assertEqual(result["my_reaction"], "😮")
+        other_csrf = self.login("viewer", self.client)
+        other = self.client.put(endpoint, json={"reaction": "👍"}, headers={"X-CSRF-Token": other_csrf}).get_json()
+        self.assertEqual(other["reactions"]["👍"], 1)
+        self.assertEqual(other["reactions"]["😮"], 1)
+        for _attempt in range(2):
+            cleared = viewer.put(endpoint, json={"reaction": None}, headers={"X-CSRF-Token": csrf}).get_json()
+            self.assertIsNone(cleared["my_reaction"])
+            self.assertEqual(cleared["reactions"]["😮"], 0)
+            self.assertEqual(cleared["reactions"]["👍"], 1)
+
+    def test_playback_requires_actual_report_and_ten_server_seconds_once_per_ticket(self):
+        identifier, csrf = self.publish()
+        now = time.time()
+        with patch.object(server.time, "time", return_value=now):
+            ticket = self.start_playback(identifier, csrf)
+            for invalid in (None, True, "10", [], -1, 9.999, float("nan"), float("inf"), 10**400):
+                self.assertEqual(self.qualify(identifier, ticket, csrf, invalid).status_code, 400)
+            early = self.qualify(identifier, ticket, csrf).get_json()
+            self.assertFalse(early["qualified"])
+            self.assertEqual(early["retry_after"], 10)
+            self.assertEqual(early["engagement"]["views"], 0)
+        with patch.object(server.time, "time", return_value=now + 9.999):
+            early = self.qualify(identifier, ticket, csrf).get_json()
+            self.assertFalse(early["qualified"])
+            self.assertGreater(early["retry_after"], 0)
+        with patch.object(server.time, "time", return_value=now + 10):
+            for _attempt in range(3):
+                result = self.qualify(identifier, ticket, csrf).get_json()
+                self.assertTrue(result["qualified"])
+                self.assertEqual(result["engagement"]["views"], 1)
+            second = self.start_playback(identifier, csrf)
+        with patch.object(server.time, "time", return_value=now + 20):
+            self.assertEqual(self.qualify(identifier, second, csrf).get_json()["engagement"]["views"], 2)
+
+    def test_concurrent_playback_duplicates_and_independent_tickets_increment_correctly(self):
+        identifier, csrf = self.publish()
+        now = time.time()
+        with patch.object(server.time, "time", return_value=now):
+            tickets = [self.start_playback(identifier, csrf) for _item in range(3)]
+        cookie = self.client.get_cookie("playnow_session").value
+
+        def complete(ticket):
+            client = self.app.test_client()
+            client.set_cookie("playnow_session", cookie)
+            response = self.qualify(identifier, ticket, csrf, client=client)
+            return response.status_code, response.get_json()
+
+        with patch.object(server.time, "time", return_value=now + 10):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                results = list(pool.map(complete, [tickets[0]] * 6))
+            self.assertTrue(all(status == 200 and body["qualified"] for status, body in results), results)
+            self.assertEqual(self.client.get(f"/api/engagement/{identifier}").get_json()["views"], 1)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(complete, [tickets[1], tickets[2], tickets[1], tickets[2]]))
+            self.assertTrue(all(status == 200 and body["qualified"] for status, body in results), results)
+            self.assertEqual(self.client.get(f"/api/engagement/{identifier}").get_json()["views"], 3)
+
+    def test_engagement_auth_origin_scope_and_revoked_share_are_enforced(self):
+        first, _old_csrf = self.publish()
+        second, csrf = self.publish(b"second-private-video")
+        share, token = self.make_share(first, csrf)
+        guest = self.app.test_client()
+        guest_state = guest.get("/api/session").get_json()
+        self.assertEqual(guest.get(f"/api/engagement/{first}").status_code, 401)
+        for path, payload in ((f"/api/engagement/{first}/reaction", {"reaction": "👍"}), (f"/api/engagement/{first}/playback", {})):
+            method = guest.put if path.endswith("reaction") else guest.post
+            self.assertEqual(method(path, json=payload, headers={"X-CSRF-Token": guest_state["csrf"]}).status_code, 401)
+        scoped, grant = self.redeem(token)
+        headers = {"X-CSRF-Token": grant["csrf"]}
+        self.assertEqual(scoped.get(f"/api/engagement/{first}").status_code, 200)
+        self.assertEqual(scoped.get(f"/api/engagement/{second}").status_code, 403)
+        own = f"/api/engagement/{first}/reaction"
+        self.assertEqual(scoped.put(own, json={"reaction": "👍"}).status_code, 403)
+        for extra in ({"Origin": "https://evil.example"}, {"Sec-Fetch-Site": "cross-site"}):
+            self.assertEqual(scoped.put(own, json={"reaction": "👍"}, headers=headers | extra).status_code, 403)
+        self.assertEqual(scoped.put(own, json={"reaction": "👍"}, headers=headers).status_code, 200)
+        playback_path = f"/api/engagement/{first}/playback"
+        self.assertEqual(scoped.post(playback_path).status_code, 403)
+        self.assertEqual(scoped.post(playback_path, headers=headers | {"Origin": "https://evil.example"}).status_code, 403)
+        ticket = self.start_playback(first, grant["csrf"], scoped)
+        self.assertEqual(scoped.post(f"{playback_path}/{ticket}", json={"played_seconds": 10}).status_code, 403)
+        self.assertEqual(scoped.post(f"{playback_path}/{ticket}", json={"played_seconds": 10}, headers=headers | {"Sec-Fetch-Site": "cross-site"}).status_code, 403)
+        self.assertEqual(scoped.put(f"/api/engagement/{second}/reaction", json={"reaction": "👍"}, headers=headers).status_code, 403)
+        self.assertEqual(scoped.post(f"/api/engagement/{second}/playback", headers=headers).status_code, 403)
+        self.assertEqual(self.qualify(second, ticket, grant["csrf"], client=scoped).status_code, 403)
+        # Existing administrative restrictions under /api/videos stay intact.
+        self.assertEqual(scoped.post(f"/api/videos/{first}/playback", headers=headers).status_code, 403)
+        self.assertEqual(self.client.delete(f"/api/videos/{first}/shares/{share['id']}", headers={"X-CSRF-Token": csrf}).status_code, 200)
+        self.assertEqual(scoped.get(f"/api/engagement/{first}").status_code, 401)
+        self.assertEqual(scoped.put(own, json={"reaction": None}, headers=headers).status_code, 403)
+        self.assertEqual(self.qualify(first, ticket, grant["csrf"], client=scoped).status_code, 403)
+
+    def test_playback_tickets_bind_browser_and_session_and_prune_expiry(self):
+        identifier, csrf = self.publish()
+        now = time.time()
+        with patch.object(server.time, "time", return_value=now):
+            ticket = self.start_playback(identifier, csrf)
+        other = self.app.test_client()
+        other_csrf = self.login("viewer", other)
+        with patch.object(server.time, "time", return_value=now + 10):
+            self.assertEqual(self.qualify(identifier, ticket, other_csrf, client=other).status_code, 404)
+            rotated_csrf = self.login("viewer")
+            self.assertEqual(self.qualify(identifier, ticket, rotated_csrf).status_code, 404)
+            expiring = self.start_playback(identifier, rotated_csrf)
+        with patch.object(server.time, "time", return_value=now + 10 + server.PLAYBACK_TICKET_SECONDS):
+            self.assertEqual(self.qualify(identifier, expiring, rotated_csrf).status_code, 404)
+            self.start_playback(identifier, rotated_csrf)
+            with sqlite3.connect(Path(self.temp.name) / "catalog.sqlite3") as connection:
+                connection.execute("UPDATE sessions SET expires=? WHERE role='viewer'", (now - 1,))
+            # Keep the mocked clock forward so cookie signature time stays valid;
+            # this denial must be caused by server-side session expiry.
+            self.assertEqual(self.client.get(f"/api/engagement/{identifier}").status_code, 401)
+            self.assertEqual(self.qualify(identifier, expiring, rotated_csrf).status_code, 403)
+        with sqlite3.connect(Path(self.temp.name) / "catalog.sqlite3") as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM playback_tickets WHERE id IN (?,?)", (ticket, expiring)).fetchone()[0], 0)
+
+    def test_engagement_persists_across_restart_and_cascades_on_video_deletion(self):
+        identifier, csrf = self.publish()
+        endpoint = f"/api/engagement/{identifier}"
+        reaction = self.client.put(endpoint + "/reaction", json={"reaction": "🤣"}, headers={"X-CSRF-Token": csrf})
+        self.assertEqual(reaction.status_code, 200)
+        now = time.time()
+        with patch.object(server.time, "time", return_value=now):
+            ticket = self.start_playback(identifier, csrf)
+        cookie = self.client.get_cookie("playnow_session").value
+        restarted = server.create_app(self.config).test_client()
+        restarted.set_cookie("playnow_session", cookie)
+        with patch.object(server.time, "time", return_value=now + 10):
+            result = self.qualify(identifier, ticket, csrf, client=restarted).get_json()
+            self.assertEqual(result["engagement"]["views"], 1)
+            self.assertEqual(result["engagement"]["my_reaction"], "🤣")
+        restarted_again = server.create_app(self.config).test_client()
+        # Use the pre-clock-jump cookie so its signature is not future-dated.
+        restarted_again.set_cookie("playnow_session", cookie)
+        self.assertEqual(restarted_again.get(endpoint).get_json(), result["engagement"])
+        self.assertEqual(restarted_again.get("/api/videos").get_json()["videos"][0]["engagement"], result["engagement"])
+        self.assertEqual(restarted_again.delete(f"/api/videos/{identifier}", headers={"X-CSRF-Token": csrf}).status_code, 200)
+        self.assertEqual(restarted_again.get(endpoint).status_code, 404)
+        with sqlite3.connect(Path(self.temp.name) / "catalog.sqlite3") as connection:
+            for table in ("video_engagement", "video_reactions", "playback_tickets"):
+                self.assertEqual(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
+
+    def test_engagement_additive_migration_preserves_old_cookie_with_parallel_initializers(self):
+        identifier, csrf = self.publish()
+        # Simulate a database and signed cookie from before engagement existed.
+        with sqlite3.connect(Path(self.temp.name) / "catalog.sqlite3") as connection:
+            for table in ("video_reactions", "playback_tickets", "video_engagement"):
+                connection.execute(f"DROP TABLE {table}")
+        with self.client.session_transaction() as signed:
+            signed.pop("audience_id", None)
+        cookie = self.client.get_cookie("playnow_session").value
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            applications = list(pool.map(lambda _item: server.create_app(self.config), range(2)))
+        clients = [app.test_client() for app in applications]
+        for client in clients:
+            client.set_cookie("playnow_session", cookie)
+            self.assertEqual(client.get("/api/session").get_json()["csrf"], csrf)
+            self.assertEqual(client.get(f"/api/engagement/{identifier}").get_json()["views"], 0)
+        audiences = []
+        for client in clients:
+            with client.session_transaction() as signed:
+                audiences.append(signed["audience_id"])
+        self.assertEqual(audiences[0], audiences[1])
+        self.assertEqual(len(audiences[0]), 64)
 
     def test_upload_fingerprint_resumes_changed_mtime_without_merging_different_bytes(self):
         csrf = self.login()

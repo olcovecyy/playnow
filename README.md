@@ -11,9 +11,14 @@ PlayNow je otevřený webový katalog a přehrávač vlastních videí. Nahraje�
 - Upload po 8 MiB až do **100 GiB**, pozastavení a navázání opětovným výběrem stejného souboru. Na iPhonu nabízí výběr z Fotek i Souborů.
 - Zachování originálu včetně 4K/120 fps a samostatnou menší H.264 kopii do **Full HD / 60 fps**. Přehrávač umožňuje obě verze přepínat.
 - Úpravu titulku, popisu i skutečného názvu souboru při zachování jeho přípony a sdílecích odkazů.
+- Počet zhlédnutí po alespoň 10 sekundách skutečného přehrávání a měnitelné reakce 👍 🤣 🤪 😭 😮.
 - Docker Compose, oddělená metadata a mediální disk, volitelné HTTPS přes Caddy.
 
 Skutečné přehrávání originálu závisí na kodeku, prohlížeči, zařízení a rychlosti připojení. Menší verzi připravuje omezený samostatný worker; nejde o živý převod 4K a příprava může trvat déle než samotné video. Na telefonu nech během velkého uploadu prohlížeč otevřený a displej odemčený. Uspání lze blokovat jen podle možností prohlížeče.
+
+Zhlédnutí se započítá nejvýše jednou za otevření přehrávače, až po 10 sekundách skutečného přehrávání ve viditelné kartě. Pauza, načítání a přeskočené úseky se nezapočítávají; přepnutí kvality již přehraný čas zachová. Opakované odeslání stejného přehrávání nepřidá další zhlédnutí. Jde o počet přehrání, nikoli unikátních lidí. Server zároveň vyžaduje alespoň 10 sekund od zahájení přehrávání; samotný průběh videa vyhodnocuje prohlížeč.
+
+Prohlížeč může mít u videa jednu reakci. Dalším stiskem ji zrušíš, jinou reakcí nahradíš. Identita je náhodná a uložená v podepsané relační cookie; přihlášení jinou rolí ji zachová, ale jiný prohlížeč nebo vymazání cookies vytvoří novou. Statistiky i reakce respektují přihlášení a omezení sdíleného odkazu na jediné video.
 
 ## Rychlé spuštění
 

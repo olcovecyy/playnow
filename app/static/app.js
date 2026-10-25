@@ -24,10 +24,21 @@ let toastTimer;
 let processingTimer;
 let playerVideoId = null;
 let playerQuality = null;
+let playerSourceRevision = 0;
 let shareViewRevision = 0;
 let screenWakeLock = null;
 let screenWakeLockRequest = null;
 let screenWakeLockRevision = 0;
+const REACTIONS = Object.freeze(['👍', '🤣', '🤪', '😭', '😮']);
+const REACTION_LABELS = Object.freeze({ '👍': 'Líbí se mi', '🤣': 'To je sranda', '🤪': 'Bláznivé', '😭': 'Rozplakalo mě', '😮': 'Překvapilo mě' });
+const engagementCache = new Map();
+const reactionRequests = new Map();
+const engagementControllers = new Set();
+let engagementEpoch = 0;
+let engagementReadSequence = 0;
+let engagementMutationSequence = 0;
+let playbackGeneration = 0;
+let playbackTracker = null;
 function node(tag, classes, text) { const el = document.createElement(tag); if (classes) el.className = classes; if (text !== undefined) el.textContent = text; return el; }
 function icon(name, classes) { const el = node('span', classes); el.innerHTML = icons[name]; return el; }
 function button(text, classes, handler) { const el = node('button', classes, text); el.type = 'button'; if (handler) el.addEventListener('click', handler); return el; }
@@ -38,21 +49,31 @@ function eta(seconds) { if (!Number.isFinite(seconds) || seconds < 0) return '';
 function date(value) { if (!value) return ''; const d = new Date(typeof value === 'number' ? value * 1000 : value); return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString('cs-CZ', { day: 'numeric', month: 'short', year: 'numeric' }); }
 function remember(upload) { try { const all = JSON.parse(localStorage.getItem('playnow.uploads') || '{}'); all[upload.id] = { filename: upload.file.name, size: upload.file.size, lastModified: upload.file.lastModified, content_fingerprint: upload.contentFingerprint || null }; localStorage.setItem('playnow.uploads', JSON.stringify(all)); } catch (_) {} }
 function remembered(id) { try { return JSON.parse(localStorage.getItem('playnow.uploads') || '{}')[id]; } catch (_) { return null; } }
-function applySession(session) { state.role = session.role || null; state.csrf = session.csrf || ''; state.scopedVideoId = session.video_id || null; }
+function applySession(session) { const nextRole = session.role || null, nextCsrf = session.csrf || '', nextVideo = session.video_id || null; if (state.role !== nextRole || state.csrf !== nextCsrf || state.scopedVideoId !== nextVideo) resetEngagementSession(); state.role = nextRole; state.csrf = nextCsrf; state.scopedVideoId = nextVideo; }
 function forget(id) { try { const all = JSON.parse(localStorage.getItem('playnow.uploads') || '{}'); delete all[id]; localStorage.setItem('playnow.uploads', JSON.stringify(all)); } catch (_) {} }
 async function api(path, options = {}) {
+  const requestEpoch = engagementEpoch;
   const opts = { credentials: 'same-origin', ...options, headers: { ...(options.headers || {}) } };
   if (opts.method && opts.method !== 'GET') opts.headers['X-CSRF-Token'] = state.csrf;
   if (opts.json !== undefined) { opts.body = JSON.stringify(opts.json); opts.headers['Content-Type'] = 'application/json'; delete opts.json; }
   const response = await fetch(path, opts);
-  let body; try { body = await response.json(); } catch (_) { body = {}; }
+  let body; try { body = await response.json(); } catch (error) { if (error.name === 'AbortError' || opts.signal?.aborted) throw error; body = {}; }
+  if (opts.signal?.aborted) { const aborted = new Error('Request aborted'); aborted.name = 'AbortError'; throw aborted; }
   if (!response.ok) {
     const error = new Error(body.error || `Požadavek se nepodařil (${response.status}).`); error.status = response.status; error.data = body;
-    if (response.status === 401 && path !== '/api/login' && path !== '/api/share/redeem') {
+    if (response.status === 401 && requestEpoch === engagementEpoch && path !== '/api/login' && path !== '/api/share/redeem') {
       state.role = null; state.scopedVideoId = null;
       if (state.upload) { state.upload.paused = true; state.upload.controller?.abort(); }
       renderLogin('Přístup vypršel nebo byl zrušený. Můžeš se přihlásit heslem.');
-      try { const fresh = await fetch('/api/session', { credentials: 'same-origin' }); if (fresh.ok) applySession(await fresh.json()); } catch (_) {}
+      const refreshEpoch = engagementEpoch, refreshController = new AbortController();
+      engagementControllers.add(refreshController);
+      try {
+        const fresh = await fetch('/api/session', { credentials: 'same-origin', signal: refreshController.signal });
+        if (fresh.ok && refreshEpoch === engagementEpoch && !refreshController.signal.aborted) {
+          const session = await fresh.json();
+          if (refreshEpoch === engagementEpoch && !refreshController.signal.aborted) applySession(session);
+        }
+      } catch (_) {} finally { engagementControllers.delete(refreshController); }
     }
     throw error;
   }
@@ -70,6 +91,7 @@ function header() {
   }
 }
 function renderLogin(message = '') {
+  resetEngagementSession();
   ++state.selectionRevision; state.preparingFile = false;
   clearTimeout(processingTimer); closePlayer(); releaseScreenWakeLock(); if ($('share-dialog').open) $('share-dialog').close();
   header(); const main = $('app'); main.replaceChildren();
@@ -91,13 +113,14 @@ function renderLogin(message = '') {
 async function logout() {
   if (state.upload && !state.upload.paused && !confirm('Nahrávání se pozastaví. Chceš se odhlásit?')) return;
   ++state.selectionRevision; state.preparingFile = false; state.pendingSelection = null;
+  resetEngagementSession();
   if (state.upload) { state.upload.paused = true; state.upload.controller?.abort(); }
   releaseScreenWakeLock();
   try { await api('/api/logout', { method: 'POST' }); } catch (error) { if (error.status !== 401) { toast(error.message); return; } }
   state.role = null; state.scopedVideoId = null; state.upload = null; state.csrf = ''; try { const session = await api('/api/session'); applySession(session); } catch (_) {} renderLogin();
 }
 async function loadCatalog() {
-  const result = await api('/api/videos'); state.videos = result.videos || []; state.storage = result.storage;
+  const read = engagementReadContext(); const result = await api('/api/videos'); if (read.epoch !== engagementEpoch || !state.role) return; state.videos = result.videos || []; state.storage = result.storage; ingestCatalogEngagement(state.videos, read);
   if (state.role === 'admin' && state.adminPage) { const uploads = await api('/api/uploads'); state.uploads = uploads.uploads || []; }
   renderCatalog();
   scheduleProcessingPoll();
@@ -125,10 +148,128 @@ function videoCard(video) {
   if (video.description) card.append(node('p', 'description', video.description));
   const meta = node('div', 'video-meta'); const parts = [date(video.created_at), size(video.size)].filter(Boolean); meta.textContent = parts.join(' · '); card.append(meta);
   const quality = originalQuality(video); if (quality) card.append(node('p', 'source-quality', `Originál · ${quality}`));
+  card.append(createEngagementSurface(video, 'card'));
   const status = processingStatus(video); if (status !== 'none') { const badge = node('div', `processing-badge status-${status}`); if (status === 'queued' || status === 'processing') badge.append(node('span', 'status-dot')); badge.append(document.createTextNode(({ queued: 'Čeká na přípravu snadné verze', processing: 'Připravujeme snadné přehrávání', ready: 'Snadné přehrávání připravené', failed: 'Snadná verze se nepodařila' })[status] || '')); card.append(badge); }
   if (state.role === 'admin' && state.adminPage) { const actions = node('div', 'video-admin-actions'); actions.append(button('Upravit', '', () => editVideo(video)), button('Sdílet', '', () => openSharing(video))); if (status === 'failed' || (status === 'none' && (Math.max(Number(video.source_width || 0), Number(video.source_height || 0)) >= 3800 || Number(video.source_fps || 0) > 60))) actions.append(button(status === 'failed' ? 'Připravit znovu' : 'Připravit snadnou verzi', '', () => prepareVideo(video))); actions.append(button('Smazat', '', () => deleteVideo(video))); card.append(actions); }
   return card;
 }
+function normalizedEngagement(value) {
+  const input = value || {}, reactions = {};
+  REACTIONS.forEach(reaction => { const count = Number(input.reactions?.[reaction]); reactions[reaction] = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0; });
+  const count = Number(input.views);
+  return { views: Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0, reactions, my_reaction: REACTIONS.includes(input.my_reaction) ? input.my_reaction : null };
+}
+function engagementReadContext() { return { epoch: engagementEpoch, sequence: ++engagementReadSequence, mutation: engagementMutationSequence }; }
+function resetEngagementSession() {
+  ++engagementEpoch; stopPlaybackTracking();
+  engagementControllers.forEach(controller => controller.abort()); engagementControllers.clear(); reactionRequests.clear(); engagementCache.clear();
+}
+function receiveEngagement(identifier, incoming, context, kind = 'read', notify = true) {
+  if (!state.role || context.epoch !== engagementEpoch) return false;
+  const previous = engagementCache.get(identifier);
+  if (kind === 'read' && (reactionRequests.has(identifier) || previous && (previous.mutation > context.mutation || previous.sequence > context.sequence))) return false;
+  const value = normalizedEngagement(incoming);
+  if (previous) { value.views = Math.max(previous.value.views, value.views); if (kind === 'view') { value.reactions = previous.value.reactions; value.my_reaction = previous.value.my_reaction; } }
+  const entry = { value, sequence: Math.max(previous?.sequence || 0, context.sequence || 0), mutation: kind === 'read' ? previous?.mutation || 0 : ++engagementMutationSequence };
+  engagementCache.set(identifier, entry);
+  const video = state.videos.find(item => item.id === identifier); if (video) video.engagement = value;
+  if (notify) updateEngagementSurfaces(identifier);
+  return true;
+}
+function ingestCatalogEngagement(videos, context) {
+  videos.forEach(video => { receiveEngagement(video.id, video.engagement, context, 'read', false); video.engagement = engagementCache.get(video.id)?.value || normalizedEngagement(video.engagement); });
+}
+function engagementFor(video) { return engagementCache.get(video.id)?.value || normalizedEngagement(video.engagement); }
+function localizedCount(value) { return Number(value).toLocaleString('cs-CZ'); }
+function fillEngagementSurface(surface, video) {
+  const current = engagementFor(video), busy = reactionRequests.has(video.id), active = document.activeElement;
+  const restoreReaction = surface.contains(active) ? active.dataset.reaction : null; surface.replaceChildren();
+  const views = node('div', 'engagement-views'); views.append(icon('eye'), node('span', '', `${localizedCount(current.views)} zhlédnutí`)); surface.append(views);
+  const reactions = node('div', 'reaction-list'); reactions.setAttribute('role', 'group'); reactions.setAttribute('aria-label', 'Reakce na video'); reactions.setAttribute('aria-busy', String(busy));
+  REACTIONS.forEach(reaction => {
+    const selected = current.my_reaction === reaction, control = button('', `reaction-button${selected ? ' is-selected' : ''}`, () => changeReaction(video.id, reaction));
+    control.dataset.reaction = reaction; control.disabled = busy; control.setAttribute('aria-pressed', String(selected)); control.setAttribute('aria-label', `${REACTION_LABELS[reaction]}, ${localizedCount(current.reactions[reaction])} reakcí. ${selected ? 'Odebrat moji reakci' : 'Přidat moji reakci'}`); control.title = REACTION_LABELS[reaction];
+    const face = node('span', 'reaction-emoji', reaction), count = node('span', 'reaction-count', localizedCount(current.reactions[reaction])); face.setAttribute('aria-hidden', 'true'); count.setAttribute('aria-hidden', 'true'); control.append(face, count); reactions.append(control);
+  }); surface.append(reactions);
+  if (restoreReaction) { const replacement = Array.from(reactions.querySelectorAll('button')).find(control => control.dataset.reaction === restoreReaction); if (replacement && !replacement.disabled) replacement.focus({ preventScroll: true }); }
+}
+function createEngagementSurface(video, mode) { const surface = node('div', `engagement-panel ${mode === 'card' ? 'card-engagement' : 'player-engagement'}`); surface.dataset.engagementVideo = video.id; surface.dataset.engagementMode = mode; fillEngagementSurface(surface, video); return surface; }
+function renderPlayerEngagement(video) { const surface = $('player-engagement'); surface.hidden = false; surface.dataset.engagementVideo = video.id; surface.dataset.engagementMode = 'player'; fillEngagementSurface(surface, video); }
+function updateEngagementSurfaces(identifier) {
+  if (!state.role) return; const video = state.videos.find(item => item.id === identifier); if (!video) return;
+  document.querySelectorAll('[data-engagement-video]').forEach(surface => { if (surface.dataset.engagementVideo === identifier) fillEngagementSurface(surface, video); });
+}
+async function refreshEngagement(identifier, tracker = null) {
+  const context = engagementReadContext(), controller = new AbortController(); engagementControllers.add(controller);
+  try { const result = await api(`/api/engagement/${encodeURIComponent(identifier)}`, { signal: controller.signal }); if (!controller.signal.aborted && (!tracker || currentPlaybackTracker(tracker))) receiveEngagement(identifier, result, context); }
+  catch (_) {} finally { engagementControllers.delete(controller); }
+}
+async function refreshEngagementSession(context) {
+  if (context.epoch !== engagementEpoch) return;
+  try { const session = await api('/api/session'); if (context.epoch !== engagementEpoch) return; applySession(session); if (!state.role) renderLogin('Přístup vypršel nebo byl zrušený. Můžeš se přihlásit heslem.'); } catch (_) {}
+}
+async function changeReaction(identifier, reaction) {
+  if (!state.role || !REACTIONS.includes(reaction) || reactionRequests.has(identifier)) return;
+  const video = state.videos.find(item => item.id === identifier); if (!video) return;
+  const current = engagementFor(video), desired = current.my_reaction === reaction ? null : reaction, context = engagementReadContext(), controller = new AbortController();
+  reactionRequests.set(identifier, controller); engagementControllers.add(controller); updateEngagementSurfaces(identifier);
+  try { const result = await api(`/api/engagement/${encodeURIComponent(identifier)}/reaction`, { method: 'PUT', json: { reaction: desired }, signal: controller.signal }); if (!controller.signal.aborted) receiveEngagement(identifier, result, context, 'reaction'); }
+  catch (error) { if (!controller.signal.aborted && context.epoch === engagementEpoch) { if (error.status === 403) await refreshEngagementSession(context); if (context.epoch === engagementEpoch) toast('Reakci se nepodařilo uložit. Zkus to prosím znovu.'); } }
+  finally { engagementControllers.delete(controller); if (reactionRequests.get(identifier) === controller) { reactionRequests.delete(identifier); updateEngagementSurfaces(identifier); } }
+}
+function currentPlaybackTracker(tracker) { return playbackTracker === tracker && tracker.epoch === engagementEpoch && playerVideoId === tracker.videoId && $('player-dialog').open && !!state.role; }
+function beginPlaybackTracking(video) {
+  stopPlaybackTracking();
+  const tracker = { generation: ++playbackGeneration, epoch: engagementEpoch, videoId: video.id, clock: PlayNowWatchTime.create(), active: false, hasPlayed: false, ticket: null, minimum: 10, starting: false, qualifying: false, qualified: false, disabled: false, nextStart: 0, nextQualify: 0, controller: new AbortController(), timer: null };
+  playbackTracker = tracker; engagementControllers.add(tracker.controller); tracker.timer = setInterval(() => samplePlaybackTracker(tracker), 250);
+}
+function stopPlaybackTracking() { const tracker = playbackTracker; playbackTracker = null; if (!tracker) return; clearInterval(tracker.timer); tracker.controller.abort(); engagementControllers.delete(tracker.controller); }
+function suspendPlaybackTracking() { if (playbackTracker) { playbackTracker.active = false; PlayNowWatchTime.reset(playbackTracker.clock); } }
+function samplePlaybackTracker(tracker) {
+  if (!currentPlaybackTracker(tracker) || tracker.disabled || tracker.qualified) return;
+  const player = $('video-player');
+  PlayNowWatchTime.sample(tracker.clock, { nowMs: performance.now(), mediaTime: player.currentTime, playbackRate: player.playbackRate, playing: tracker.active, paused: player.paused, seeking: player.seeking, readyState: player.readyState, ended: player.ended, visible: !document.hidden });
+  if (tracker.active && !player.paused && !player.seeking && player.readyState >= 3 && !document.hidden) ensurePlaybackTicket(tracker);
+  qualifyPlayback(tracker);
+}
+async function ensurePlaybackTicket(tracker) {
+  if (!currentPlaybackTracker(tracker) || tracker.disabled || tracker.ticket || tracker.starting || tracker.qualified || performance.now() < tracker.nextStart) return;
+  tracker.starting = true;
+  try {
+    const result = await api(`/api/engagement/${encodeURIComponent(tracker.videoId)}/playback`, { method: 'POST', json: {}, signal: tracker.controller.signal });
+    if (!currentPlaybackTracker(tracker) || tracker.controller.signal.aborted) return;
+    if (typeof result.playback_id !== 'string' || !result.playback_id) throw new Error('Invalid playback ticket');
+    tracker.ticket = result.playback_id; tracker.minimum = Math.max(10, Number(result.minimum_seconds) || 10); qualifyPlayback(tracker);
+  } catch (error) { if (currentPlaybackTracker(tracker) && !tracker.controller.signal.aborted) { if (error.status === 401 || error.status === 403) { tracker.disabled = true; if (error.status === 403) refreshEngagementSession({ epoch: tracker.epoch }); } else tracker.nextStart = performance.now() + 3000; } }
+  finally { tracker.starting = false; }
+}
+async function qualifyPlayback(tracker) {
+  if (!currentPlaybackTracker(tracker) || tracker.disabled || tracker.qualified || tracker.qualifying || !tracker.ticket || performance.now() < tracker.nextQualify || !PlayNowWatchTime.reached(tracker.clock, tracker.minimum)) return;
+  tracker.qualifying = true; const context = engagementReadContext();
+  try {
+    const played = Math.max(tracker.minimum, Math.floor(tracker.clock.seconds * 1000) / 1000);
+    const result = await api(`/api/engagement/${encodeURIComponent(tracker.videoId)}/playback/${encodeURIComponent(tracker.ticket)}`, { method: 'POST', json: { played_seconds: played }, signal: tracker.controller.signal });
+    if (!currentPlaybackTracker(tracker) || tracker.controller.signal.aborted) return;
+    if (result.engagement) receiveEngagement(tracker.videoId, result.engagement, context, 'view');
+    if (result.qualified) { tracker.qualified = true; clearInterval(tracker.timer); tracker.timer = null; }
+    else tracker.nextQualify = performance.now() + (Math.max(0.25, Math.min(60, Number(result.retry_after) || 1)) * 1000) + 100;
+  } catch (error) { if (currentPlaybackTracker(tracker) && !tracker.controller.signal.aborted) { if ([400, 401, 403, 404].includes(error.status)) { tracker.disabled = true; if (error.status === 403) refreshEngagementSession(context); } else tracker.nextQualify = performance.now() + 3000; } }
+  finally { tracker.qualifying = false; }
+}
+const trackedPlayer = $('video-player');
+trackedPlayer.addEventListener('playing', () => { const tracker = playbackTracker; if (!tracker || !currentPlaybackTracker(tracker)) return; tracker.hasPlayed = true; tracker.active = true; PlayNowWatchTime.reset(tracker.clock); samplePlaybackTracker(tracker); });
+function finishPlaybackInterval() {
+  const tracker = playbackTracker;
+  if (tracker && currentPlaybackTracker(tracker) && tracker.active && !trackedPlayer.seeking && !tracker.disabled && !tracker.qualified) {
+    PlayNowWatchTime.sample(tracker.clock, { nowMs: performance.now(), mediaTime: trackedPlayer.currentTime, playbackRate: trackedPlayer.playbackRate, playing: true, paused: false, seeking: false, readyState: 3, ended: false, visible: !document.hidden });
+    qualifyPlayback(tracker);
+  }
+  suspendPlaybackTracking();
+}
+['pause', 'waiting', 'stalled', 'ended'].forEach(event => trackedPlayer.addEventListener(event, finishPlaybackInterval));
+['seeking', 'emptied', 'error'].forEach(event => trackedPlayer.addEventListener(event, suspendPlaybackTracking));
+trackedPlayer.addEventListener('seeked', () => { const tracker = playbackTracker; if (!tracker || !currentPlaybackTracker(tracker)) return; PlayNowWatchTime.reset(tracker.clock); tracker.active = tracker.hasPlayed && !trackedPlayer.paused && trackedPlayer.readyState >= 3; samplePlaybackTracker(tracker); });
+trackedPlayer.addEventListener('ratechange', () => { if (playbackTracker) PlayNowWatchTime.reset(playbackTracker.clock); });
 function processingStatus(video) { return video.processing_status || video.compatibility?.status || 'none'; }
 function resolutionLabel(width, height) {
   const longer = Math.max(Number(width || 0), Number(height || 0)), shorter = Math.min(Number(width || 0), Number(height || 0));
@@ -149,10 +290,11 @@ function compatibleQuality(video) {
 }
 function versionLabel(video, quality) { const label = quality === 'original' ? originalQuality(video) : compatibleQuality(video); return label ? `${label} — ${quality === 'original' ? 'originál' : 'menší verze'}` : quality === 'original' ? 'Originál' : 'Menší verze'; }
 function setPlayerSource(video, quality, autoplay = true) {
+  suspendPlaybackTracking();
   const player = $('video-player'), current = Number(player.currentTime) || 0; playerQuality = quality; $('player-error').hidden = true;
   const source = quality === 'compatible' ? video.compatible_url : (video.original_url || video.stream_url || `/media/${encodeURIComponent(video.id)}?quality=original`);
-  if (!source) return; player.hidden = false; $('player-preparation').hidden = true;
-  if (current > 0) player.addEventListener('loadedmetadata', () => { try { player.currentTime = Math.min(current, Math.max(0, (player.duration || current) - .1)); } catch (_) {} }, { once: true });
+  if (!source) return; const sourceRevision = ++playerSourceRevision; player.hidden = false; $('player-preparation').hidden = true;
+  if (current > 0) player.addEventListener('loadedmetadata', () => { if (sourceRevision !== playerSourceRevision || playerVideoId !== video.id) return; try { player.currentTime = Math.min(current, Math.max(0, (player.duration || current) - .1)); } catch (_) {} }, { once: true });
   player.src = source; syncPlayerDetails(video);
   if (autoplay) { const promise = player.play(); if (promise) promise.catch(() => {}); }
 }
@@ -174,12 +316,13 @@ function syncPlayerDetails(video) {
 }
 function openVideo(video) {
   closePlayer(); playerVideoId = video.id; playerQuality = null; $('player-title').textContent = video.title || video.filename; $('player-description').textContent = video.description || ''; $('player-error').hidden = true; $('player-dialog').showModal();
+  beginPlaybackTracking(video); renderPlayerEngagement(video); refreshEngagement(video.id, playbackTracker);
   const status = processingStatus(video);
   if (status === 'ready' && video.compatible_url) setPlayerSource(video, 'compatible');
   else if (status === 'none') setPlayerSource(video, 'original');
   else syncPlayerDetails(video);
 }
-function closePlayer() { const player = $('video-player'); player.pause(); player.removeAttribute('src'); player.load(); playerVideoId = null; playerQuality = null; if ($('player-dialog').open) $('player-dialog').close(); }
+function closePlayer() { ++playerSourceRevision; stopPlaybackTracking(); const player = $('video-player'); player.pause(); player.removeAttribute('src'); player.load(); playerVideoId = null; playerQuality = null; if ($('player-engagement')) { $('player-engagement').hidden = true; $('player-engagement').replaceChildren(); } if ($('player-dialog').open) $('player-dialog').close(); }
 $('player-quality').addEventListener('change', () => { const video = state.videos.find(item => item.id === playerVideoId); if (video) setPlayerSource(video, $('player-quality').value); });
 $('player-original-button').addEventListener('click', () => { const video = state.videos.find(item => item.id === playerVideoId); if (video) setPlayerSource(video, video.compatible_url && processingStatus(video) === 'ready' ? 'compatible' : 'original'); });
 function scheduleProcessingPoll(immediate = false) {
@@ -187,11 +330,11 @@ function scheduleProcessingPoll(immediate = false) {
   if (!state.role || document.hidden || !state.videos.some(video => ['queued', 'processing'].includes(processingStatus(video)))) return;
   processingTimer = setTimeout(async () => {
     if (!state.role || document.hidden) return;
-    try { const result = await api('/api/videos'); state.videos = result.videos || []; state.storage = result.storage; const collection = $('video-collection'); if (collection) { collection.replaceChildren(); state.videos.forEach(video => collection.append(videoCard(video))); } const playing = state.videos.find(video => video.id === playerVideoId); if (playing) syncPlayerDetails(playing); }
+    try { const read = engagementReadContext(); const result = await api('/api/videos'); if (read.epoch !== engagementEpoch || !state.role) return; state.videos = result.videos || []; state.storage = result.storage; ingestCatalogEngagement(state.videos, read); const collection = $('video-collection'); if (collection) { collection.replaceChildren(); state.videos.forEach(video => collection.append(videoCard(video))); } const playing = state.videos.find(video => video.id === playerVideoId); if (playing) syncPlayerDetails(playing); }
     catch (_) {} finally { scheduleProcessingPoll(); }
   }, immediate ? 20 : 15000);
 }
-document.addEventListener('visibilitychange', () => { scheduleProcessingPoll(true); updateScreenWakeLock(); });
+document.addEventListener('visibilitychange', () => { scheduleProcessingPoll(true); updateScreenWakeLock(); if (playbackTracker) PlayNowWatchTime.reset(playbackTracker.clock); });
 window.addEventListener('pagehide', releaseScreenWakeLock);
 $('close-player').addEventListener('click', closePlayer); $('player-dialog').addEventListener('close', () => { if (!$('player-dialog').open) closePlayer(); }); $('player-dialog').addEventListener('click', (event) => { if (event.target === $('player-dialog')) { const rect = $('player-dialog').getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) closePlayer(); } });
 $('video-player').addEventListener('error', () => {

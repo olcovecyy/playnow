@@ -18,6 +18,8 @@ Pro úpravy klienta zkontroluj syntaxi také pomocí Node.js:
 
 ```sh
 node --check app/static/app.js
+node --check app/static/watchtime.js
+node --test test_playback.js
 ```
 
 Docker sestavení:
@@ -33,5 +35,6 @@ docker build -t playnow:dev .
 - Přejmenování bez přepsání cizího souboru, oprava přerušené operace a stejné ID videa.
 - Oddělená konfigurace, metadata a média; chybějící mediální disk znamená chybu, nikoli náhradní ukládání.
 - Responzivní české rozhraní a pravdivé stavy přípravy videa.
+- Zhlédnutí až po 10 sekundách skutečného přehrávání bez započítání pauzy, seeku či změny kvality; idempotentní zápis a jedna měnitelná reakce na prohlížeč.
 
 K pull requestu přidej stručný popis problému, výsledné změny a provedené kontroly. Změny rozhraní dolož snímkem s umělými daty. U změn úložiště ověř i přerušení operace a obnovu; u změn přístupů také nepovolené scénáře. Nezaváděj obecný refaktor kvůli malé opravě.

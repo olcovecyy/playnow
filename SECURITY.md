@@ -43,6 +43,15 @@ an independent penetration test or a guarantee that a deployment is secure.
 
 ## Deployment requirements
 
+Views and reactions have the same viewer/share authorization boundaries as the
+video itself. Playback tickets are bound to the browser identity, authenticated
+session and video; each ticket qualifies at most once and expires. The server
+checks a minimum elapsed time while the browser reports actual playback progress.
+This is a viewing metric, not protection against deliberate falsification by an
+authenticated client. Reactions use an opaque browser identifier in the signed
+session cookie; clearing cookies creates a new identity. Engagement records do
+not add IP addresses or personal profiles. Existing login throttling is separate.
+
 Use HTTPS for remote access. Set `PLAYNOW_PUBLIC_URL` to the exact public origin
 and `PLAYNOW_COOKIE_SECURE=1` behind TLS. Keep the application port private to the
 trusted reverse proxy. Leave `PLAYNOW_TRUSTED_PROXY_COUNT=0` unless the configured

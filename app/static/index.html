@@ -8,6 +8,7 @@
   <meta name="description" content="Soukromé kino pro rodinu a přátele.">
   <title>PlayNow — naše soukromé kino</title>
   <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/watchtime.js" defer></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -26,6 +27,7 @@
     <p id="player-quality-note" class="player-quality-note" hidden></p>
     <video id="video-player" controls playsinline preload="metadata"></video>
     <p id="player-error" class="notice error" hidden>Video se v tomto prohlížeči nepodařilo přehrát. Zkus zvolit druhou verzi nahoře nebo obnov stránku.</p>
+    <section id="player-engagement" class="engagement-panel player-engagement" aria-label="Zhlédnutí a reakce" hidden></section>
     <p id="player-description" class="player-description"></p>
   </dialog>
   <dialog id="edit-dialog" class="form-dialog" aria-labelledby="edit-heading">
