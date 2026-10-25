@@ -1,0 +1,64 @@
+name: playnow
+
+x-app: &app
+  image: "${PLAYNOW_IMAGE:-playnow:local}"
+  build:
+    context: .
+    dockerfile: Dockerfile
+  user: "${PLAYNOW_UID:-1000}:${PLAYNOW_GID:-1000}"
+  env_file:
+    - ./runtime.env
+  environment:
+    PLAYNOW_DATA_DIR: /data
+    PLAYNOW_STORAGE_DIR: /media-storage
+    PLAYNOW_TRANSCODE_ENABLED: "1"
+  volumes:
+    - type: bind
+      source: "${PLAYNOW_DATA_PATH:?Run python3 scripts/setup.py first}"
+      target: /data
+      bind:
+        create_host_path: false
+    - type: bind
+      source: "${PLAYNOW_MEDIA_PATH:?Run python3 scripts/setup.py first}"
+      target: /media-storage
+      bind:
+        create_host_path: false
+  read_only: true
+  init: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  restart: unless-stopped
+  pids_limit: 128
+  stop_grace_period: 45s
+
+services:
+  web:
+    <<: *app
+    ports:
+      - "127.0.0.1:${PLAYNOW_PORT:-8080}:8000"
+    cpus: "${PLAYNOW_WEB_CPUS:-1.0}"
+    mem_limit: "${PLAYNOW_WEB_MEMORY:-512m}"
+    tmpfs:
+      - /tmp:size=134217728,mode=1777
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5).read()"]
+      interval: 30s
+      timeout: 8s
+      start_period: 20s
+      retries: 3
+    networks: [frontend]
+
+  worker:
+    <<: *app
+    command: [python, transcode.py]
+    depends_on:
+      web:
+        condition: service_healthy
+    network_mode: none
+    cpus: "${PLAYNOW_WORKER_CPUS:-1.0}"
+    mem_limit: "${PLAYNOW_WORKER_MEMORY:-1536m}"
+    tmpfs:
+      - /tmp:size=268435456,mode=1777
+
+networks:
+  frontend:

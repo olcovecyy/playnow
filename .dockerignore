@@ -1,0 +1,13 @@
+# Explicit build allowlist: private data/config and stray app assets stay excluded.
+**
+!Dockerfile
+!.dockerignore
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!app/
+!app/*.py
+!app/requirements.txt
+!app/static/
+!app/static/*.html
+!app/static/*.js
+!app/static/*.css

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#131116">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <meta name="description" content="Soukromé kino pro rodinu a přátele.">
+  <title>PlayNow — naše soukromé kino</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="ambient ambient-one" aria-hidden="true"></div><div class="ambient ambient-two" aria-hidden="true"></div>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="PlayNow domů"><span class="brand-symbol" aria-hidden="true">p<span></span></span><span>playnow<span class="brand-dot">.</span></span></a>
+    <nav id="header-actions" aria-label="Hlavní navigace"></nav>
+  </header>
+  <main id="app" tabindex="-1"><div class="initial-loading"><span class="spinner"></span><p>Chystáme vaše kino…</p></div></main>
+  <footer class="site-footer"><span>Jen pro naše lidi.</span><span>PlayNow <span class="footer-star">✦</span> Soukromé kino</span></footer>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <dialog id="player-dialog" class="player-dialog" aria-labelledby="player-title">
+    <div class="player-top"><div><p class="eyebrow">TEĎ HRAJE</p><h2 id="player-title"></h2></div><button id="close-player" class="icon-button" aria-label="Zavřít přehrávač">×</button></div>
+    <div id="player-quality-row" class="player-quality-row" hidden><label for="player-quality">Kvalita přehrávání</label><select id="player-quality"><option value="compatible">Menší verze</option><option value="original">Originál</option></select></div>
+    <div id="player-preparation" class="player-preparation" hidden><span class="spinner" aria-hidden="true"></span><h3 id="player-preparation-title">Připravujeme pohodlné přehrávání.</h3><p id="player-preparation-text"></p><button id="player-original-button" class="button primary" type="button">Pustit originál</button></div>
+    <p id="player-quality-note" class="player-quality-note" hidden></p>
+    <video id="video-player" controls playsinline preload="metadata"></video>
+    <p id="player-error" class="notice error" hidden>Video se v tomto prohlížeči nepodařilo přehrát. Zkus zvolit druhou verzi nahoře nebo obnov stránku.</p>
+    <p id="player-description" class="player-description"></p>
+  </dialog>
+  <dialog id="edit-dialog" class="form-dialog" aria-labelledby="edit-heading">
+    <form id="edit-form"><div class="dialog-heading"><h2 id="edit-heading">Upravit video</h2><button type="button" id="close-edit" class="icon-button" aria-label="Zavřít">×</button></div><label>Název videa v knihovně<input id="edit-title" maxlength="180" required></label><label for="edit-filename">Název souboru</label><div class="filename-edit-row"><input id="edit-filename" maxlength="240" required aria-describedby="edit-filename-help" autocomplete="off" spellcheck="false"><span id="edit-filename-extension" class="filename-extension" aria-label="Přípona souboru"></span></div><p id="edit-filename-help" class="filename-edit-help"></p><label>Popis<textarea id="edit-description" maxlength="3000" rows="4"></textarea></label><p id="edit-error" class="form-error" role="alert"></p><button class="button primary" type="submit">Uložit změny</button></form>
+  </dialog>
+  <dialog id="share-dialog" class="form-dialog share-dialog" aria-labelledby="share-heading">
+    <div class="dialog-heading"><h2 id="share-heading">Sdílet video</h2><button type="button" id="close-share" class="icon-button" aria-label="Zavřít sdílení">×</button></div>
+    <p id="share-video-title" class="share-video-title"></p>
+    <p class="share-intro">Odkaz otevře rovnou toto video bez hesla. Každý, kdo ho má, si může pustit jen toto video. Přístup můžeš kdykoli zrušit.</p>
+    <button type="button" id="create-share" class="button primary">Vytvořit odkaz</button>
+    <section id="share-new" class="share-new" hidden aria-label="Nový odkaz">
+      <label for="share-url">Odkaz pro rodinu a přátele</label>
+      <div class="share-copy-row"><input id="share-url" type="text" readonly autocomplete="off" autocapitalize="off" spellcheck="false"><button type="button" id="copy-share" class="button">Kopírovat</button></div>
+      <p>Ulož si ho teď. Po zavření se celý odkaz znovu nezobrazí.</p>
+    </section>
+    <p id="share-error" class="form-error" role="alert"></p>
+    <h3 class="share-list-heading">Vytvořené odkazy</h3>
+    <div id="share-list" class="share-list" aria-live="polite"></div>
+  </dialog>
+  <noscript><div class="noscript">Pro přihlášení a přehrávání zapni v prohlížeči JavaScript.</div></noscript>
+</body>
+</html>

@@ -1,0 +1,33 @@
+# Run from the repository root:
+# docker compose -f compose.yaml -f deploy/compose.https.yaml up -d --build
+# setup --public-url must use the same HTTPS origin and enable secure cookies.
+services:
+  caddy:
+    image: caddy:2.11.7-alpine
+    ports:
+      - "80:80"
+      - "${PLAYNOW_HTTPS_PORT:-443}:${PLAYNOW_HTTPS_PORT:-443}"
+    environment:
+      PLAYNOW_DOMAIN: "${PLAYNOW_DOMAIN:?Run setup with --public-url https://your-domain}"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [frontend]
+    depends_on:
+      web:
+        condition: service_healthy
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=67108864,mode=1777
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: "0.5"
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,12 @@
+# Caddy runs beside web via deploy/compose.https.yaml.
+# PLAYNOW_DOMAIN is generated from the exact HTTPS public origin.
+{$PLAYNOW_DOMAIN} {
+    request_body {
+        max_size 9MiB
+    }
+    reverse_proxy web:8000 {
+        # One trusted proxy hop. Replace client-provided forwarding headers.
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto https
+    }
+}
